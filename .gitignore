@@ -7,3 +7,5 @@
 /tmp
 /storage
 .DS_Store
+/internal/webdist/dist/
+!/internal/webdist/dist/*.go
