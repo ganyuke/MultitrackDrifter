@@ -58,7 +58,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 	authSvc := auth.New(database, cfg)
 	hub := realtime.NewHub()
-	worker := ingest.NewWorker(database, cfg, source, hls)
+	worker := ingest.NewWorker(database, cfg, source, hls, hub)
 	worker.Start(ctx)
 	srv := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(database, cfg, authSvc, source, hls, worker, hub, httpapi.StaticHandler()).Routes(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {

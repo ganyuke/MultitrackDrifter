@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +15,12 @@ import (
 
 	"github.com/example/multitrack-drifter/internal/config"
 	ff "github.com/example/multitrack-drifter/internal/ffmpeg"
+	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
 	"github.com/example/multitrack-drifter/internal/storage/localstore"
 )
+
+const idlePollInterval = 5 * time.Second
 
 type Worker struct {
 	db     *sql.DB
@@ -24,60 +28,143 @@ type Worker struct {
 	source storage.SourceStore
 	hls    storage.HLSStore
 	runner ff.Runner
-	jobs   chan int64
+	notify chan struct{}
+	hub    *realtime.Hub
 }
 
-func NewWorker(db *sql.DB, cfg config.Config, source storage.SourceStore, hls storage.HLSStore) *Worker {
-	queueSize := max(64, cfg.IngestWorkers*16)
-	return &Worker{db: db, cfg: cfg, source: source, hls: hls, runner: ff.Runner{FFmpeg: cfg.FFmpegBin, FFprobe: cfg.FFprobeBin}, jobs: make(chan int64, queueSize)}
-}
-
-func (w *Worker) Start(ctx context.Context) {
-	workerCount := max(1, w.cfg.IngestWorkers)
-	for range workerCount {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case jobID := <-w.jobs:
-					w.process(ctx, jobID)
-				}
-			}
-		}()
+func NewWorker(db *sql.DB, cfg config.Config, source storage.SourceStore, hls storage.HLSStore, hub *realtime.Hub) *Worker {
+	workerCount := max(1, cfg.IngestWorkers)
+	return &Worker{
+		db:     db,
+		cfg:    cfg,
+		source: source,
+		hls:    hls,
+		runner: ff.Runner{FFmpeg: cfg.FFmpegBin, FFprobe: cfg.FFprobeBin},
+		notify: make(chan struct{}, workerCount),
+		hub:    hub,
 	}
 }
 
-func (w *Worker) Enqueue(jobID int64) {
+func (w *Worker) Start(ctx context.Context) {
+	if err := w.requeueInterruptedJobs(ctx); err != nil {
+		log.Printf("ingest: failed to requeue interrupted jobs: %v", err)
+	}
+
+	workerCount := max(1, w.cfg.IngestWorkers)
+	for range workerCount {
+		go w.run(ctx)
+	}
+	w.Notify()
+}
+
+func (w *Worker) run(ctx context.Context) {
+	for {
+		job, ok, err := w.claimNextJob(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("ingest: failed to claim job: %v", err)
+			if ok {
+				continue
+			}
+			if !w.waitForWork(ctx) {
+				return
+			}
+			continue
+		}
+		if !ok {
+			if !w.waitForWork(ctx) {
+				return
+			}
+			continue
+		}
+		w.process(ctx, job)
+	}
+}
+
+func (w *Worker) waitForWork(ctx context.Context) bool {
 	select {
-	case w.jobs <- jobID:
-	default:
-		go func() { w.jobs <- jobID }()
+	case <-ctx.Done():
+		return false
+	case <-w.notify:
+		return true
+	case <-time.After(idlePollInterval):
+		return true
+	}
+}
+
+func (w *Worker) Notify() {
+	workerCount := max(1, w.cfg.IngestWorkers)
+	for range workerCount {
+		select {
+		case w.notify <- struct{}{}:
+		default:
+			return
+		}
 	}
 }
 
 func (w *Worker) EnqueueProject(ctx context.Context, projectID int64) ([]int64, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT id FROM clips WHERE project_id = ? AND ingest_status IN ('PENDING','FAILED')`, projectID)
+	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var clipID int64
-		if err := rows.Scan(&clipID); err != nil {
-			return nil, err
-		}
-		var jobID int64
-		res, err := w.db.ExecContext(ctx, `INSERT INTO ingest_jobs(project_id, clip_id, state) VALUES (?, ?, 'PENDING')`, projectID, clipID)
-		if err != nil {
-			return nil, err
-		}
-		jobID, _ = res.LastInsertId()
-		ids = append(ids, jobID)
-		w.Enqueue(jobID)
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+INSERT INTO ingest_jobs(project_id, clip_id, state)
+SELECT c.project_id, c.id, 'PENDING'
+FROM clips c
+WHERE c.project_id=?
+  AND c.ingest_status IN ('PENDING','FAILED')
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ingest_jobs j
+    WHERE j.project_id=c.project_id
+      AND j.clip_id=c.id
+      AND j.state IN ('PENDING','PROCESSING')
+  )
+ORDER BY c.id
+RETURNING id, clip_id`, projectID)
+	if err != nil {
+		return nil, err
 	}
-	return ids, rows.Err()
+	var jobIDs []int64
+	var clipIDs []int64
+	for rows.Next() {
+		var jobID, clipID int64
+		if err := rows.Scan(&jobID, &clipID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+		clipIDs = append(clipIDs, clipID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, clipID := range clipIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE clips SET ingest_status='PENDING', updated_at=datetime('now') WHERE id=? AND ingest_status='FAILED'`, clipID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if len(jobIDs) > 0 {
+		w.Notify()
+	}
+	return jobIDs, nil
+}
+
+type claimedJob struct {
+	JobID     int64
+	ProjectID int64
+	ClipID    int64
 }
 
 type clipJob struct {
@@ -91,33 +178,98 @@ type clipJob struct {
 	DisplayName      string
 }
 
-func (w *Worker) process(ctx context.Context, jobID int64) {
-	if err := w.processErr(ctx, jobID); err != nil {
-		_, _ = w.db.ExecContext(context.Background(), `UPDATE ingest_jobs SET state='FAILED', error=?, finished_at=datetime('now') WHERE id=?`, err.Error(), jobID)
-	}
-}
-
-func (w *Worker) processErr(ctx context.Context, jobID int64) error {
-	job, err := w.loadJob(ctx, jobID)
+func (w *Worker) requeueInterruptedJobs(ctx context.Context) error {
+	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	_, _ = w.db.ExecContext(ctx, `UPDATE ingest_jobs SET state='PROCESSING', started_at=datetime('now') WHERE id=?`, jobID)
-	_, _ = w.db.ExecContext(ctx, `UPDATE clips SET ingest_status='PROCESSING', updated_at=datetime('now') WHERE id=?`, job.ClipID)
+	if _, err := tx.ExecContext(ctx, `
+UPDATE clips
+SET ingest_status='PENDING', updated_at=datetime('now')
+WHERE ingest_status='PROCESSING'
+  AND id IN (SELECT clip_id FROM ingest_jobs WHERE state='PROCESSING')`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE ingest_jobs
+SET state='PENDING',
+    error='server restarted while processing; requeued',
+    started_at=NULL,
+    finished_at=NULL
+WHERE state='PROCESSING'`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("ingest: requeued %d interrupted job(s)", n)
+	}
+	return nil
+}
+
+func (w *Worker) claimNextJob(ctx context.Context) (claimedJob, bool, error) {
+	var job claimedJob
+	err := w.db.QueryRowContext(ctx, `
+UPDATE ingest_jobs
+SET state='PROCESSING',
+    started_at=datetime('now'),
+    finished_at=NULL,
+    error=''
+WHERE id = (
+  SELECT id
+  FROM ingest_jobs
+  WHERE state='PENDING'
+  ORDER BY id
+  LIMIT 1
+)
+RETURNING id, project_id, clip_id`).Scan(&job.JobID, &job.ProjectID, &job.ClipID)
+	if err == sql.ErrNoRows {
+		return claimedJob{}, false, nil
+	}
+	if err != nil {
+		return claimedJob{}, false, err
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE clips SET ingest_status='PROCESSING', updated_at=datetime('now') WHERE id=?`, job.ClipID); err != nil {
+		w.failClaimed(context.Background(), job, err)
+		return claimedJob{}, true, err
+	}
+	w.broadcastIngest(job.ProjectID, job.ClipID, job.JobID, "PROCESSING", "")
+	return job, true, nil
+}
+
+func (w *Worker) process(ctx context.Context, claimed claimedJob) {
+	if err := w.processErr(ctx, claimed); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		w.failClaimed(context.Background(), claimed, err)
+	}
+}
+
+func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
+	job, err := w.loadJob(ctx, claimed.JobID)
+	if err != nil {
+		return err
+	}
 
 	if ok, err := w.attachExistingHLS(ctx, job); err != nil {
-		return w.failClip(ctx, job, err)
+		return err
 	} else if ok {
+		w.broadcastIngest(job.ProjectID, job.ClipID, job.JobID, "SUCCESS", "")
 		return nil
 	}
 
 	input, err := w.inputPath(ctx, job.SourcePath)
 	if err != nil {
-		return w.failClip(ctx, job, err)
+		return err
 	}
 	probe, err := w.runner.Probe(ctx, input)
 	if err != nil {
-		return w.failClip(ctx, job, err)
+		return err
 	}
 	streamIndex, kind, meta := ff.FirstPlayable(probe)
 	if job.StreamIndex >= 0 {
@@ -136,11 +288,11 @@ func (w *Worker) processErr(ctx context.Context, jobID int64) error {
 	if ok, _ := w.manifestExists(ctx, assetPath+"/index.m3u8"); !ok {
 		tmp, err := os.MkdirTemp("", "drifter-hls-*")
 		if err != nil {
-			return w.failClip(ctx, job, err)
+			return err
 		}
 		defer os.RemoveAll(tmp)
 		if err := w.runner.TranscodeHLS(ctx, input, tmp, streamIndex, kind); err != nil {
-			return w.failClip(ctx, job, err)
+			return err
 		}
 		if err := filepath.WalkDir(tmp, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
@@ -161,13 +313,13 @@ func (w *Worker) processErr(ctx context.Context, jobID int64) error {
 			}
 			return w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: filepath.ToSlash(filepath.Join(assetPath, rel))}, f, contentType)
 		}); err != nil {
-			return w.failClip(ctx, job, err)
+			return err
 		}
 	}
 
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
-		return w.failClip(ctx, job, err)
+		return err
 	}
 	var hlsID int64
 	err = tx.QueryRowContext(ctx, `
@@ -177,17 +329,21 @@ ON CONFLICT(source_revision_id, stream_id, transcode_profile_version) DO UPDATE 
 RETURNING id`, job.SourceRevisionID, w.cfg.HLSAdapter, assetPath+"/index.m3u8", fmt.Sprintf("stream-%d", streamIndex), kind, w.cfg.TranscodeProfile, meta.DurationMS, meta.FPSNum, meta.FPSDen).Scan(&hlsID)
 	if err != nil {
 		_ = tx.Rollback()
-		return w.failClip(ctx, job, err)
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE clips SET hls_asset_id=?, duration_ms=?, fps_num=NULLIF(?,0), fps_den=NULLIF(?,0), stream_index=?, media_kind=?, ingest_status='SUCCESS', updated_at=datetime('now') WHERE id=?`, hlsID, meta.DurationMS, meta.FPSNum, meta.FPSDen, streamIndex, kind, job.ClipID); err != nil {
 		_ = tx.Rollback()
-		return w.failClip(ctx, job, err)
+		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ingest_jobs SET state='SUCCESS', error='', finished_at=datetime('now') WHERE id=?`, jobID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ingest_jobs SET state='SUCCESS', error='', finished_at=datetime('now') WHERE id=?`, job.JobID); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	w.broadcastIngest(job.ProjectID, job.ClipID, job.JobID, "SUCCESS", "")
+	return nil
 }
 
 func (w *Worker) loadJob(ctx context.Context, jobID int64) (clipJob, error) {
@@ -195,7 +351,7 @@ func (w *Worker) loadJob(ctx context.Context, jobID int64) (clipJob, error) {
 	err := w.db.QueryRowContext(ctx, `
 SELECT j.id, j.project_id, c.id, c.source_revision_id, r.path, c.media_kind, c.stream_index, c.display_name
 FROM ingest_jobs j JOIN clips c ON c.id=j.clip_id JOIN source_asset_revisions r ON r.id=c.source_revision_id
-WHERE j.id=?`, jobID).Scan(&j.JobID, &j.ProjectID, &j.ClipID, &j.SourceRevisionID, &j.SourcePath, &j.MediaKind, &j.StreamIndex, &j.DisplayName)
+WHERE j.id=? AND j.state='PROCESSING'`, jobID).Scan(&j.JobID, &j.ProjectID, &j.ClipID, &j.SourceRevisionID, &j.SourcePath, &j.MediaKind, &j.StreamIndex, &j.DisplayName)
 	return j, err
 }
 
@@ -253,10 +409,28 @@ func (w *Worker) manifestExists(ctx context.Context, rel string) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) failClip(ctx context.Context, job clipJob, err error) error {
+func (w *Worker) failClaimed(ctx context.Context, job claimedJob, err error) {
+	msg := err.Error()
 	_, _ = w.db.ExecContext(ctx, `UPDATE clips SET ingest_status='FAILED', updated_at=datetime('now') WHERE id=?`, job.ClipID)
-	_, _ = w.db.ExecContext(ctx, `UPDATE ingest_jobs SET state='FAILED', error=?, finished_at=datetime('now') WHERE id=?`, err.Error(), job.JobID)
-	return err
+	_, _ = w.db.ExecContext(ctx, `UPDATE ingest_jobs SET state='FAILED', error=?, finished_at=datetime('now') WHERE id=?`, msg, job.JobID)
+	w.broadcastIngest(job.ProjectID, job.ClipID, job.JobID, "FAILED", msg)
+}
+
+func (w *Worker) broadcastIngest(projectID, clipID, jobID int64, state, errMsg string) {
+	if w.hub == nil || projectID == 0 {
+		return
+	}
+	w.hub.Broadcast(projectID, realtime.Event{
+		Type:      "clip.ingest.updated",
+		ProjectID: projectID,
+		User:      "system",
+		Payload: map[string]any{
+			"clipId": clipID,
+			"jobId":  jobID,
+			"state":  state,
+			"error":  errMsg,
+		},
+	})
 }
 
 func immutableAssetPath(revisionID int64, streamIndex int, profile string) string {

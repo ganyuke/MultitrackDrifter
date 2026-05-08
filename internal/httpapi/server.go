@@ -688,7 +688,9 @@ LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), arg
 		jobIDs = append(jobIDs, jobID)
 		p.activeJobID = jobID
 		plans[clipID] = p
-		s.ingest.Enqueue(jobID)
+	}
+	if len(jobIDs) > 0 {
+		s.ingest.Notify()
 	}
 	return jobIDs, nil
 }
