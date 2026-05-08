@@ -34,6 +34,7 @@ type HLSStore interface {
 	Put(ctx context.Context, ref ObjectRef, r io.Reader, contentType string) error
 	List(ctx context.Context, prefix string, delimiter string) ([]ObjectInfo, error)
 	Open(ctx context.Context, ref ObjectRef) (io.ReadCloser, error)
+	Stat(ctx context.Context, ref ObjectRef) (ObjectInfo, error)
 	PresignRead(ctx context.Context, ref ObjectRef, ttl time.Duration) (string, error)
 	PublicOrSignedURL(ctx context.Context, ref ObjectRef, ttl time.Duration) (string, error)
 }

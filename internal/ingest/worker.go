@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,27 +28,31 @@ type Worker struct {
 }
 
 func NewWorker(db *sql.DB, cfg config.Config, source storage.SourceStore, hls storage.HLSStore) *Worker {
-	return &Worker{db: db, cfg: cfg, source: source, hls: hls, runner: ff.Runner{FFmpeg: cfg.FFmpegBin, FFprobe: cfg.FFprobeBin}, jobs: make(chan int64, 64)}
+	queueSize := max(64, cfg.IngestWorkers*16)
+	return &Worker{db: db, cfg: cfg, source: source, hls: hls, runner: ff.Runner{FFmpeg: cfg.FFmpegBin, FFprobe: cfg.FFprobeBin}, jobs: make(chan int64, queueSize)}
 }
 
 func (w *Worker) Start(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case jobID := <-w.jobs:
-				w.process(ctx, jobID)
+	workerCount := max(1, w.cfg.IngestWorkers)
+	for range workerCount {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case jobID := <-w.jobs:
+					w.process(ctx, jobID)
+				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
 func (w *Worker) Enqueue(jobID int64) {
 	select {
 	case w.jobs <- jobID:
 	default:
-		go w.process(context.Background(), jobID)
+		go func() { w.jobs <- jobID }()
 	}
 }
 
@@ -243,12 +246,10 @@ func (w *Worker) inputPath(ctx context.Context, sourcePath string) (string, erro
 }
 
 func (w *Worker) manifestExists(ctx context.Context, rel string) (bool, error) {
-	rc, err := w.hls.Open(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: rel})
+	_, err := w.hls.Stat(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: rel})
 	if err != nil {
 		return false, nil
 	}
-	_, _ = io.Copy(io.Discard, rc)
-	_ = rc.Close()
 	return true, nil
 }
 

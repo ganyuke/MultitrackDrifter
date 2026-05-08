@@ -1,13 +1,16 @@
 package httpapi
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -105,9 +108,9 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.FromContext(r.Context())
-	// Sliding refresh endpoint behavior keeps long review sessions alive without silent logout.
+	// Keep long review sessions alive, but avoid rewriting the session row on every /api/me poll.
 	if c, err := r.Cookie(auth.CookieName); err == nil {
-		if refreshed, err := s.auth.Refresh(r.Context(), c.Value); err == nil {
+		if refreshed, err := s.auth.RefreshIfNeeded(r.Context(), c.Value, p); err == nil {
 			p = refreshed
 		}
 	}
@@ -617,27 +620,64 @@ func trackIDFor(ctx context.Context, tx *sql.Tx, projectID, perspectiveID int64,
 }
 
 func (s *Server) enqueueClipJobs(ctx context.Context, projectID int64, clipIDs []int64) ([]int64, error) {
+	if len(clipIDs) == 0 {
+		return nil, nil
+	}
+
+	values := make([]string, 0, len(clipIDs))
+	args := make([]any, 0, len(clipIDs)+2)
+	for _, clipID := range clipIDs {
+		values = append(values, "(?)")
+		args = append(args, clipID)
+	}
+	args = append(args, projectID, projectID)
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+WITH requested(clip_id) AS (VALUES %s),
+active_jobs AS (
+	SELECT clip_id, MAX(id) AS job_id
+	FROM ingest_jobs
+	WHERE project_id=? AND state IN ('PENDING','PROCESSING')
+	GROUP BY clip_id
+)
+SELECT r.clip_id, c.ingest_status, COALESCE(a.job_id, 0)
+FROM requested r
+JOIN clips c ON c.id=r.clip_id AND c.project_id=?
+LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type plan struct {
+		status      string
+		activeJobID int64
+	}
+	plans := make(map[int64]plan, len(clipIDs))
+	for rows.Next() {
+		var clipID int64
+		var p plan
+		if err := rows.Scan(&clipID, &p.status, &p.activeJobID); err != nil {
+			return nil, err
+		}
+		plans[clipID] = p
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	jobIDs := make([]int64, 0, len(clipIDs))
 	for _, clipID := range clipIDs {
-		var status string
-		if err := s.db.QueryRowContext(ctx, `SELECT ingest_status FROM clips WHERE id=? AND project_id=?`, clipID, projectID).Scan(&status); err != nil {
-			return nil, err
+		p, ok := plans[clipID]
+		if !ok {
+			return nil, fmt.Errorf("clip %d not found in project %d", clipID, projectID)
 		}
-		if status == "SUCCESS" {
+		if p.status == "SUCCESS" {
 			continue
 		}
-
-		var existingJobID int64
-		err := s.db.QueryRowContext(ctx, `
-SELECT id FROM ingest_jobs
-WHERE project_id=? AND clip_id=? AND state IN ('PENDING','PROCESSING')
-ORDER BY id DESC LIMIT 1`, projectID, clipID).Scan(&existingJobID)
-		if err == nil {
-			jobIDs = append(jobIDs, existingJobID)
+		if p.activeJobID != 0 {
+			jobIDs = append(jobIDs, p.activeJobID)
 			continue
-		}
-		if err != sql.ErrNoRows {
-			return nil, err
 		}
 
 		res, err := s.db.ExecContext(ctx, `INSERT INTO ingest_jobs(project_id, clip_id, state) VALUES (?, ?, 'PENDING')`, projectID, clipID)
@@ -646,6 +686,8 @@ ORDER BY id DESC LIMIT 1`, projectID, clipID).Scan(&existingJobID)
 		}
 		jobID, _ := res.LastInsertId()
 		jobIDs = append(jobIDs, jobID)
+		p.activeJobID = jobID
+		plans[clipID] = p
 		s.ingest.Enqueue(jobID)
 	}
 	return jobIDs, nil
@@ -1139,25 +1181,23 @@ func (s *Server) requireOwner(w http.ResponseWriter, r *http.Request, projectID 
 }
 
 func (s *Server) canEditMarker(ctx context.Context, projectID, markerID int64, username string) bool {
-	if s.isOwner(ctx, projectID, username) {
-		return true
-	}
-	var author string
-	_ = s.db.QueryRowContext(ctx, `SELECT author_username FROM markers WHERE id=? AND project_id=?`, markerID, projectID).Scan(&author)
-	return author == username
+	var allowed int
+	err := s.db.QueryRowContext(ctx, `
+SELECT CASE WHEN p.owner_username=? OR m.author_username=? THEN 1 ELSE 0 END
+FROM markers m
+JOIN projects p ON p.id=m.project_id
+WHERE m.id=? AND m.project_id=?`, username, username, markerID, projectID).Scan(&allowed)
+	return err == nil && allowed == 1
 }
+
 func (s *Server) canEditRegion(ctx context.Context, projectID, regionID int64, username string) bool {
-	if s.isOwner(ctx, projectID, username) {
-		return true
-	}
-	var author string
-	_ = s.db.QueryRowContext(ctx, `SELECT author_username FROM regions WHERE id=? AND project_id=?`, regionID, projectID).Scan(&author)
-	return author == username
-}
-func (s *Server) isOwner(ctx context.Context, projectID int64, username string) bool {
-	var owner string
-	_ = s.db.QueryRowContext(ctx, `SELECT owner_username FROM projects WHERE id=?`, projectID).Scan(&owner)
-	return owner == username
+	var allowed int
+	err := s.db.QueryRowContext(ctx, `
+SELECT CASE WHEN p.owner_username=? OR r.author_username=? THEN 1 ELSE 0 END
+FROM regions r
+JOIN projects p ON p.id=r.project_id
+WHERE r.id=? AND r.project_id=?`, username, username, regionID, projectID).Scan(&allowed)
+	return err == nil && allowed == 1
 }
 
 func (s *Server) broadcast(r *http.Request, projectID int64, typ string, payload any) {
@@ -1233,6 +1273,71 @@ func titleKind(kind string) string {
 	return "Video"
 }
 
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *loggingResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *loggingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	if w.status == 0 {
+		w.status = http.StatusSwitchingProtocols
+	}
+	return h.Hijack()
+}
+
+func (w *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		if w.status == 0 {
+			w.status = http.StatusOK
+		}
+		n, err := rf.ReadFrom(r)
+		w.bytes += n
+		return n, err
+	}
+	type onlyWriter struct{ io.Writer }
+	return io.Copy(onlyWriter{w}, r)
+}
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { start := time.Now(); next.ServeHTTP(w, r); _ = start })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		recorder := &loggingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("http %s %s status=%d bytes=%d duration=%s", r.Method, r.URL.Path, status, recorder.bytes, time.Since(start))
+	})
 }

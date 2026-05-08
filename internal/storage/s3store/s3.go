@@ -39,6 +39,9 @@ func (h *HLS) List(ctx context.Context, prefix string, delimiter string) ([]stor
 func (h *HLS) Open(ctx context.Context, ref storage.ObjectRef) (io.ReadCloser, error) {
 	return nil, errors.New("s3 hls open is not implemented")
 }
+func (h *HLS) Stat(ctx context.Context, ref storage.ObjectRef) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, errors.New("s3 hls stat is not implemented")
+}
 func (h *HLS) PresignRead(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
 	return "", errors.New("s3 hls presign is not implemented")
 }

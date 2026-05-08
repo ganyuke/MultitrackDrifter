@@ -167,6 +167,11 @@ CREATE INDEX IF NOT EXISTS idx_clips_project ON clips(project_id);
 CREATE INDEX IF NOT EXISTS idx_markers_project_ts ON markers(project_id, marker_ts_ms);
 CREATE INDEX IF NOT EXISTS idx_regions_project_ts ON regions(project_id, region_start_ms);
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_state ON ingest_jobs(state);
+`}, {2, `
+CREATE INDEX IF NOT EXISTS idx_perspectives_project_sort ON perspectives(project_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_tracks_project_sort ON tracks(project_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_clips_project_ingest_status ON clips(project_id, ingest_status);
+CREATE INDEX IF NOT EXISTS idx_ingest_jobs_project_state_clip ON ingest_jobs(project_id, state, clip_id, id);
 `}}
 
 func Migrate(ctx context.Context, db *sql.DB) error {

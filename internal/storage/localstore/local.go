@@ -115,6 +115,10 @@ func (h *HLS) Open(ctx context.Context, ref storage.ObjectRef) (io.ReadCloser, e
 	return openLocal(ctx, h.root, ref.Path)
 }
 
+func (h *HLS) Stat(ctx context.Context, ref storage.ObjectRef) (storage.ObjectInfo, error) {
+	return statLocal(ctx, h.root, "local", ref.Path)
+}
+
 func (h *HLS) PresignRead(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
 	return h.PublicOrSignedURL(ctx, ref, ttl)
 }

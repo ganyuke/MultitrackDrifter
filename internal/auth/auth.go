@@ -162,8 +162,23 @@ func (s *Service) Refresh(ctx context.Context, token string) (Principal, error) 
 	if err != nil {
 		return Principal{}, err
 	}
+	return s.refreshPrincipal(ctx, token, p)
+}
+
+func (s *Service) RefreshIfNeeded(ctx context.Context, token string, p Principal) (Principal, error) {
+	expiresAt, err := time.Parse(time.RFC3339, p.ExpiresAt)
+	if err != nil {
+		return s.Refresh(ctx, token)
+	}
+	if time.Until(expiresAt) > s.cfg.SessionTTL/5 {
+		return p, nil
+	}
+	return s.refreshPrincipal(ctx, token, p)
+}
+
+func (s *Service) refreshPrincipal(ctx context.Context, token string, p Principal) (Principal, error) {
 	expires := time.Now().Add(s.cfg.SessionTTL).UTC().Format(time.RFC3339)
-	_, err = s.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE token_hash = ?`, expires, s.tokenHash(token))
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE token_hash = ?`, expires, s.tokenHash(token))
 	if err != nil {
 		return Principal{}, err
 	}

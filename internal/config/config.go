@@ -27,6 +27,7 @@ type Config struct {
 	FFmpegBin         string
 	FFprobeBin        string
 	TranscodeProfile  string
+	IngestWorkers     int
 }
 
 type LDAPConfig struct {
@@ -58,6 +59,7 @@ func Load() (Config, error) {
 		FFmpegBin:         getenv("FFMPEG_BIN", "ffmpeg"),
 		FFprobeBin:        getenv("FFPROBE_BIN", "ffprobe"),
 		TranscodeProfile:  getenv("TRANSCODE_PROFILE_VERSION", "poc-480p-v1"),
+		IngestWorkers:     max(1, getenvInt("INGEST_WORKERS", 2)),
 	}
 	cfg.LDAP = LDAPConfig{
 		URL:           getenv("LDAP_URL", ""),
