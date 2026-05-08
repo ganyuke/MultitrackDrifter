@@ -2,7 +2,7 @@ package realtime
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +11,8 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+const websocketSendBuffer = 256
 
 type Event struct {
 	Type      string      `json:"type"`
@@ -38,7 +40,11 @@ func (h *Hub) Broadcast(projectID int64, ev Event) {
 	for c := range clients {
 		select {
 		case c.send <- b:
+			if len(c.send) > websocketSendBuffer*3/4 {
+				slog.Warn("realtime: client send buffer high", "project_id", projectID, "username", c.username, "queued", len(c.send), "capacity", cap(c.send))
+			}
 		default:
+			slog.Warn("realtime: client send buffer full; dropping client", "project_id", projectID, "username", c.username, "capacity", cap(c.send))
 			dead = append(dead, c)
 		}
 	}
@@ -66,6 +72,21 @@ func (h *Hub) unregister(c *Client) {
 			delete(h.projects, c.projectID)
 		}
 	}
+}
+
+func (h *Hub) presenceSnapshot(projectID int64) []map[string]string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	seen := map[string]bool{}
+	users := []map[string]string{}
+	for c := range h.projects[projectID] {
+		if seen[c.username] {
+			continue
+		}
+		seen[c.username] = true
+		users = append(users, map[string]string{"username": c.username, "color": c.color})
+	}
+	return users
 }
 
 type Client struct {
@@ -97,11 +118,25 @@ func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request, projectID int64, 
 	if err != nil {
 		return
 	}
-	c := &Client{hub: hub, conn: conn, send: make(chan []byte, 32), projectID: projectID, username: username, color: color}
+	c := &Client{hub: hub, conn: conn, send: make(chan []byte, websocketSendBuffer), projectID: projectID, username: username, color: color}
 	hub.register(c)
-	hub.Broadcast(projectID, Event{Type: "user.joined", ProjectID: projectID, User: username, Color: color, Payload: map[string]string{"username": username}})
+	c.sendEvent(Event{Type: "presence.snapshot", ProjectID: projectID, User: "system", Payload: map[string]any{"users": hub.presenceSnapshot(projectID)}})
+	hub.Broadcast(projectID, Event{Type: "user.joined", ProjectID: projectID, User: username, Color: color, Payload: map[string]string{"username": username, "color": color}})
 	go c.writePump()
 	go c.readPump()
+}
+
+func (c *Client) sendEvent(ev Event) {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- b:
+	default:
+		slog.Warn("realtime: client send buffer full during direct send", "project_id", c.projectID, "username", c.username, "capacity", cap(c.send))
+		c.Close()
+	}
 }
 
 func (c *Client) Close() {
@@ -119,8 +154,12 @@ func (c *Client) readPump() {
 	_ = c.conn.SetReadDeadline(time.Now().Add(70 * time.Second))
 	c.conn.SetPongHandler(func(string) error { _ = c.conn.SetReadDeadline(time.Now().Add(70 * time.Second)); return nil })
 	for {
-		if _, _, err := c.conn.ReadMessage(); err != nil {
+		messageType, msg, err := c.conn.ReadMessage()
+		if err != nil {
 			break
+		}
+		if messageType == websocket.TextMessage && len(msg) > 0 {
+			slog.Debug("realtime: unsupported client message", "project_id", c.projectID, "username", c.username, "bytes", len(msg))
 		}
 	}
 }
@@ -137,7 +176,7 @@ func (c *Client) writePump() {
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				log.Printf("websocket write: %v", err)
+				slog.Debug("websocket write failed", "project_id", c.projectID, "username", c.username, "err", err)
 				return
 			}
 		case <-ticker.C:

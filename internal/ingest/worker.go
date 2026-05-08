@@ -7,10 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/example/multitrack-drifter/internal/config"
@@ -20,7 +21,10 @@ import (
 	"github.com/example/multitrack-drifter/internal/storage/localstore"
 )
 
-const idlePollInterval = 5 * time.Second
+const (
+	idlePollInterval    = 5 * time.Second
+	progressMinInterval = 500 * time.Millisecond
+)
 
 type Worker struct {
 	db     *sql.DB
@@ -30,6 +34,9 @@ type Worker struct {
 	runner ff.Runner
 	notify chan struct{}
 	hub    *realtime.Hub
+
+	queueLogMu sync.Mutex
+	queueLogAt time.Time
 }
 
 func NewWorker(db *sql.DB, cfg config.Config, source storage.SourceStore, hls storage.HLSStore, hub *realtime.Hub) *Worker {
@@ -47,7 +54,7 @@ func NewWorker(db *sql.DB, cfg config.Config, source storage.SourceStore, hls st
 
 func (w *Worker) Start(ctx context.Context) {
 	if err := w.requeueInterruptedJobs(ctx); err != nil {
-		log.Printf("ingest: failed to requeue interrupted jobs: %v", err)
+		slog.ErrorContext(ctx, "ingest: failed to requeue interrupted jobs", "err", err)
 	}
 
 	workerCount := max(1, w.cfg.IngestWorkers)
@@ -64,7 +71,7 @@ func (w *Worker) run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("ingest: failed to claim job: %v", err)
+			slog.ErrorContext(ctx, "ingest: failed to claim job", "err", err)
 			if ok {
 				continue
 			}
@@ -100,9 +107,11 @@ func (w *Worker) Notify() {
 		select {
 		case w.notify <- struct{}{}:
 		default:
+			go w.logQueueDepth(context.Background())
 			return
 		}
 	}
+	go w.logQueueDepth(context.Background())
 }
 
 func (w *Worker) EnqueueProject(ctx context.Context, projectID int64) ([]int64, error) {
@@ -199,12 +208,19 @@ WHERE state='PROCESSING'`)
 		return err
 	}
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
-		log.Printf("ingest: requeued %d interrupted job(s)", n)
+		slog.InfoContext(ctx, "ingest: requeued interrupted jobs", "count", n)
 	}
 	return nil
 }
 
 func (w *Worker) claimNextJob(ctx context.Context) (claimedJob, bool, error) {
+	var pending int
+	if err := w.db.QueryRowContext(ctx, `SELECT 1 FROM ingest_jobs WHERE state='PENDING' LIMIT 1`).Scan(&pending); err == sql.ErrNoRows {
+		return claimedJob{}, false, nil
+	} else if err != nil {
+		return claimedJob{}, false, err
+	}
+
 	var job claimedJob
 	err := w.db.QueryRowContext(ctx, `
 UPDATE ingest_jobs
@@ -235,12 +251,18 @@ RETURNING id, project_id, clip_id`).Scan(&job.JobID, &job.ProjectID, &job.ClipID
 }
 
 func (w *Worker) process(ctx context.Context, claimed claimedJob) {
+	start := time.Now()
+	slog.InfoContext(ctx, "ingest: job started", "job_id", claimed.JobID, "project_id", claimed.ProjectID, "clip_id", claimed.ClipID)
 	if err := w.processErr(ctx, claimed); err != nil {
 		if ctx.Err() != nil {
+			slog.InfoContext(context.Background(), "ingest: job interrupted", "job_id", claimed.JobID, "project_id", claimed.ProjectID, "clip_id", claimed.ClipID, "duration_ms", time.Since(start).Milliseconds())
 			return
 		}
+		slog.ErrorContext(context.Background(), "ingest: job failed", "job_id", claimed.JobID, "project_id", claimed.ProjectID, "clip_id", claimed.ClipID, "duration_ms", time.Since(start).Milliseconds(), "err", err)
 		w.failClaimed(context.Background(), claimed, err)
+		return
 	}
+	slog.InfoContext(ctx, "ingest: job finished", "job_id", claimed.JobID, "project_id", claimed.ProjectID, "clip_id", claimed.ClipID, "duration_ms", time.Since(start).Milliseconds())
 }
 
 func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
@@ -278,36 +300,17 @@ func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
 	}
 
 	assetPath := immutableAssetPath(job.SourceRevisionID, streamIndex, w.cfg.TranscodeProfile)
-	if ok, _ := w.manifestExists(ctx, assetPath+"/index.m3u8"); !ok {
-		tmp, err := os.MkdirTemp("", "drifter-hls-*")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(tmp)
-		if err := w.runner.TranscodeHLS(ctx, input, tmp, streamIndex, kind); err != nil {
-			return err
-		}
-		if err := filepath.WalkDir(tmp, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			rel, _ := filepath.Rel(tmp, path)
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			contentType := "video/MP2T"
-			if strings.HasSuffix(path, ".m3u8") {
-				contentType = "application/vnd.apple.mpegurl"
-			}
-			return w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: filepath.ToSlash(filepath.Join(assetPath, rel))}, f, contentType)
-		}); err != nil {
-			return err
-		}
+	tmp, err := os.MkdirTemp("", "drifter-hls-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	progress := w.progressReporter(job.ProjectID, job.ClipID, job.JobID, meta.DurationMS)
+	if err := w.runner.TranscodeHLS(ctx, input, tmp, streamIndex, kind, ff.TranscodeOptions{Preset: w.cfg.TranscodePreset, SegmentSeconds: w.cfg.HLSSegmentSeconds, Progress: progress}); err != nil {
+		return err
+	}
+	if err := w.uploadHLSDirectory(ctx, tmp, assetPath); err != nil {
+		return err
 	}
 
 	tx, err := w.db.BeginTx(ctx, nil)
@@ -394,12 +397,137 @@ func (w *Worker) inputPath(ctx context.Context, sourcePath string) (string, erro
 	return "", fmt.Errorf("non-local source ingest is not wired in this POC; source open returned %T", rc)
 }
 
-func (w *Worker) manifestExists(ctx context.Context, rel string) (bool, error) {
-	_, err := w.hls.Stat(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: rel})
-	if err != nil {
-		return false, nil
+func (w *Worker) uploadHLSDirectory(ctx context.Context, tmp, assetPath string) error {
+	var files []string
+	if err := filepath.WalkDir(tmp, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	}); err != nil {
+		return err
 	}
-	return true, nil
+
+	workers := max(1, w.cfg.HLSUploadWorkers)
+	jobs := make(chan string)
+	errCh := make(chan error, 1)
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				if err := w.uploadHLSFile(uploadCtx, tmp, assetPath, path); err != nil {
+					select {
+					case errCh <- err:
+						cancel()
+					default:
+					}
+				}
+			}
+		}()
+	}
+
+	for _, path := range files {
+		select {
+		case <-uploadCtx.Done():
+			break
+		case jobs <- path:
+		}
+		if uploadCtx.Err() != nil {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	return ctx.Err()
+}
+
+func (w *Worker) uploadHLSFile(ctx context.Context, tmp, assetPath, path string) error {
+	rel, err := filepath.Rel(tmp, path)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	contentType := "video/MP2T"
+	if strings.HasSuffix(path, ".m3u8") {
+		contentType = "application/vnd.apple.mpegurl"
+	}
+	return w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: filepath.ToSlash(filepath.Join(assetPath, rel))}, f, contentType)
+}
+
+func (w *Worker) progressReporter(projectID, clipID, jobID, totalDurationMS int64) func(ff.Progress) {
+	if w.hub == nil || projectID == 0 || totalDurationMS <= 0 {
+		return nil
+	}
+	var mu sync.Mutex
+	var lastAt time.Time
+	var lastPct int64 = -1
+	return func(p ff.Progress) {
+		if p.TimeMS < 0 {
+			return
+		}
+		pct := p.TimeMS * 100 / totalDurationMS
+		if pct > 100 {
+			pct = 100
+		}
+		now := time.Now()
+		mu.Lock()
+		if pct == lastPct || (pct < 100 && now.Sub(lastAt) < progressMinInterval) {
+			mu.Unlock()
+			return
+		}
+		lastPct = pct
+		lastAt = now
+		mu.Unlock()
+		w.hub.Broadcast(projectID, realtime.Event{
+			Type:      "clip.ingest.progress",
+			ProjectID: projectID,
+			User:      "system",
+			Payload: map[string]any{
+				"clipId": clipID,
+				"jobId":  jobID,
+				"pct":    float64(pct) / 100,
+				"timeMs": p.TimeMS,
+			},
+		})
+	}
+}
+
+func (w *Worker) logQueueDepth(ctx context.Context) {
+	w.queueLogMu.Lock()
+	if time.Since(w.queueLogAt) < 30*time.Second {
+		w.queueLogMu.Unlock()
+		return
+	}
+	w.queueLogAt = time.Now()
+	w.queueLogMu.Unlock()
+
+	var pending int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ingest_jobs WHERE state='PENDING'`).Scan(&pending); err != nil {
+		slog.DebugContext(ctx, "ingest: queue depth unavailable", "err", err)
+		return
+	}
+	if pending > 0 {
+		slog.InfoContext(ctx, "ingest: queue depth", "pending_jobs", pending)
+	}
 }
 
 func (w *Worker) failClaimed(ctx context.Context, job claimedJob, err error) {
@@ -427,7 +555,7 @@ func (w *Worker) broadcastIngest(projectID, clipID, jobID int64, state, errMsg s
 }
 
 func immutableAssetPath(revisionID int64, streamIndex int, profile string) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s:%d", revisionID, streamIndex, profile, time.Now().Year()/1000)))
+	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s", revisionID, streamIndex, profile)))
 	return fmt.Sprintf("rev-%d/stream-%d/%s/%s", revisionID, streamIndex, profile, hex.EncodeToString(h[:])[:12])
 }
 

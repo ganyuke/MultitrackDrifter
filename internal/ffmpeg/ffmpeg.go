@@ -1,10 +1,13 @@
 package ffmpeg
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -61,6 +64,16 @@ type Runner struct {
 	FFprobe string
 }
 
+type TranscodeOptions struct {
+	Preset         string
+	SegmentSeconds int
+	Progress       func(Progress)
+}
+
+type Progress struct {
+	TimeMS int64
+}
+
 func (r Runner) Probe(ctx context.Context, input string) (Probe, error) {
 	cmd := exec.CommandContext(ctx, r.FFprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", input)
 	var out, stderr bytes.Buffer
@@ -69,6 +82,7 @@ func (r Runner) Probe(ctx context.Context, input string) (Probe, error) {
 	if err := cmd.Run(); err != nil {
 		return Probe{}, fmt.Errorf("ffprobe: %w: %s", err, stderr.String())
 	}
+	logFFmpegOutput(ctx, "ffprobe", stderr.String())
 	var p Probe
 	if err := json.Unmarshal(out.Bytes(), &p); err != nil {
 		return Probe{}, err
@@ -141,25 +155,114 @@ func StreamLabel(s Stream) string {
 	return fmt.Sprintf("Audio %d", s.Index)
 }
 
-func (r Runner) TranscodeHLS(ctx context.Context, input string, outputDir string, streamIndex int, kind string) error {
+func (r Runner) TranscodeHLS(ctx context.Context, input string, outputDir string, streamIndex int, kind string, opts TranscodeOptions) error {
+	preset := strings.TrimSpace(opts.Preset)
+	if preset == "" {
+		preset = "ultrafast"
+	}
+	segmentSeconds := opts.SegmentSeconds
+	if segmentSeconds <= 0 {
+		segmentSeconds = 2
+	}
+
 	playlist := filepath.Join(outputDir, "index.m3u8")
 	segment := filepath.Join(outputDir, "seg_%03d.ts")
 	var args []string
-	args = append(args, "-y", "-i", input, "-map", fmt.Sprintf("0:%d", streamIndex))
+	args = append(args, "-y", "-hide_banner", "-v", "warning", "-progress", "pipe:2", "-nostats", "-i", input, "-map", fmt.Sprintf("0:%d", streamIndex))
 	if kind == "audio" {
 		args = append(args, "-vn", "-c:a", "aac", "-b:a", "128k")
 	} else {
 		// Video and audio streams are represented as separate timeline tracks in the app.
-		args = append(args, "-an", "-vf", "scale=-2:480", "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28")
+		// Force a 2-second GOP by default so HLS seeks land near segment boundaries without split_by_time's non-keyframe cuts.
+		gop := strconv.Itoa(segmentSeconds * 30)
+		args = append(args, "-an", "-vf", "scale=-2:480", "-r", "30", "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-c:v", "libx264", "-preset", preset, "-crf", "28")
 	}
-	args = append(args, "-hls_time", "6", "-hls_playlist_type", "vod", "-hls_segment_filename", segment, playlist)
+	args = append(args, "-hls_time", strconv.Itoa(segmentSeconds), "-hls_playlist_type", "vod", "-hls_segment_filename", segment, playlist)
+
 	cmd := exec.CommandContext(ctx, r.FFmpeg, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ffmpeg: %w: %s", err, stderr.String())
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("ffmpeg stderr: %w", err)
+	}
+	var captured bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- scanFFmpegProgress(ctx, stderr, &captured, opts.Progress)
+	}()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("ffmpeg start: %w", err)
+	}
+	waitErr := cmd.Wait()
+	scanErr := <-done
+	stderrText := captured.String()
+	if waitErr != nil {
+		return fmt.Errorf("ffmpeg: %w: %s", waitErr, stderrText)
+	}
+	if scanErr != nil {
+		return fmt.Errorf("ffmpeg progress: %w", scanErr)
+	}
+	logFFmpegOutput(ctx, "ffmpeg", stderrText)
+	return nil
+}
+
+func scanFFmpegProgress(ctx context.Context, r io.Reader, captured *bytes.Buffer, cb func(Progress)) error {
+	s := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	s.Buffer(buf, 1024*1024)
+	for s.Scan() {
+		line := s.Text()
+		if captured.Len() < 256*1024 {
+			_, _ = captured.WriteString(line)
+			_ = captured.WriteByte('\n')
+		}
+		if cb != nil {
+			if ms, ok := progressTimeMS(line); ok {
+				cb(Progress{TimeMS: ms})
+			}
+		}
+	}
+	if err := s.Err(); err != nil && ctx.Err() == nil {
+		return err
 	}
 	return nil
+}
+
+func progressTimeMS(line string) (int64, bool) {
+	key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+	if !ok {
+		return 0, false
+	}
+	switch key {
+	case "out_time_us":
+		us, err := strconv.ParseInt(value, 10, 64)
+		return us / 1000, err == nil && us >= 0
+	case "out_time_ms":
+		// FFmpeg historically names this value "ms" even though it is microseconds.
+		us, err := strconv.ParseInt(value, 10, 64)
+		return us / 1000, err == nil && us >= 0
+	case "out_time":
+		ms := parseClockMS(value)
+		return ms, ms >= 0
+	default:
+		return 0, false
+	}
+}
+
+func logFFmpegOutput(ctx context.Context, component, output string) {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return
+	}
+	level := slog.LevelDebug
+	if containsWarning(output) {
+		level = slog.LevelWarn
+	}
+	slog.Log(ctx, level, component+": process output", "output", output)
+}
+
+func containsWarning(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "warning") || strings.Contains(lower, "error")
 }
 
 func usefulTag(v string) string {
@@ -181,6 +284,20 @@ func parseSecondsMS(v string) int64 {
 		return 0
 	}
 	return int64(f*1000 + 0.5)
+}
+
+func parseClockMS(v string) int64 {
+	parts := strings.Split(v, ":")
+	if len(parts) != 3 {
+		return -1
+	}
+	h, err1 := strconv.ParseInt(parts[0], 10, 64)
+	m, err2 := strconv.ParseInt(parts[1], 10, 64)
+	s, err3 := strconv.ParseFloat(parts[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil || h < 0 || m < 0 || s < 0 {
+		return -1
+	}
+	return h*3600000 + m*60000 + int64(s*1000+0.5)
 }
 
 func parseRate(v string) (int64, int64) {

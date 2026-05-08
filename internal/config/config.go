@@ -27,6 +27,9 @@ type Config struct {
 	FFmpegBin         string
 	FFprobeBin        string
 	TranscodeProfile  string
+	TranscodePreset   string
+	HLSSegmentSeconds int
+	HLSUploadWorkers  int
 	IngestWorkers     int
 }
 
@@ -58,7 +61,10 @@ func Load() (Config, error) {
 		HLSPresignTTL:     time.Duration(getenvInt("HLS_PRESIGN_TTL_SECONDS", 3600)) * time.Second,
 		FFmpegBin:         getenv("FFMPEG_BIN", "ffmpeg"),
 		FFprobeBin:        getenv("FFPROBE_BIN", "ffprobe"),
-		TranscodeProfile:  getenv("TRANSCODE_PROFILE_VERSION", "poc-480p-v1"),
+		TranscodeProfile:  getenv("TRANSCODE_PROFILE_VERSION", "poc-480p-v2"),
+		TranscodePreset:   getenv("TRANSCODE_PRESET", "ultrafast"),
+		HLSSegmentSeconds: max(1, getenvInt("HLS_SEGMENT_SECONDS", 2)),
+		HLSUploadWorkers:  max(1, getenvInt("HLS_UPLOAD_WORKERS", 8)),
 		IngestWorkers:     max(1, getenvInt("INGEST_WORKERS", 2)),
 	}
 	cfg.LDAP = LDAPConfig{

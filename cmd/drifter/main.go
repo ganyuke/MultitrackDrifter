@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -67,7 +69,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("drifter listening on http://%s", cfg.Addr)
+	slog.Info("drifter listening", "addr", cfg.Addr, "url", "http://"+cfg.Addr)
 	return srv.ListenAndServe()
 }
 

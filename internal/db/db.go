@@ -22,17 +22,6 @@ func Open(ctx context.Context, path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode = WAL;",
-		"PRAGMA foreign_keys = ON;",
-		"PRAGMA busy_timeout = 5000;",
-		"PRAGMA synchronous = NORMAL;",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-	}
 	if err := Migrate(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err

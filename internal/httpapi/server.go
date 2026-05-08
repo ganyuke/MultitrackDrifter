@@ -3,18 +3,21 @@ package httpapi
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/example/multitrack-drifter/internal/auth"
@@ -28,14 +31,25 @@ import (
 )
 
 type Server struct {
-	db     *sql.DB
-	cfg    config.Config
-	auth   *auth.Service
-	source storage.SourceStore
-	hls    storage.HLSStore
-	ingest *ingest.Worker
-	hub    *realtime.Hub
-	static http.Handler
+	db       *sql.DB
+	cfg      config.Config
+	auth     *auth.Service
+	source   storage.SourceStore
+	hls      storage.HLSStore
+	ingest   *ingest.Worker
+	hub      *realtime.Hub
+	static   http.Handler
+	urlCache signedURLCache
+}
+
+type signedURLCache struct {
+	mu sync.Mutex
+	m  map[string]signedURLCacheEntry
+}
+
+type signedURLCacheEntry struct {
+	url       string
+	expiresAt time.Time
 }
 
 func New(db *sql.DB, cfg config.Config, authSvc *auth.Service, source storage.SourceStore, hls storage.HLSStore, worker *ingest.Worker, hub *realtime.Hub, static http.Handler) *Server {
@@ -57,6 +71,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/projects/{projectID}/assets", s.auth.Middleware(http.HandlerFunc(s.createAssetClip)))
 	mux.Handle("POST /api/projects/{projectID}/ingest", s.auth.Middleware(http.HandlerFunc(s.triggerIngest)))
 	mux.Handle("GET /api/projects/{projectID}/ingest-jobs", s.auth.Middleware(http.HandlerFunc(s.listIngestJobs)))
+	mux.Handle("POST /api/projects/{projectID}/clips/{clipID}/ingest", s.auth.Middleware(http.HandlerFunc(s.retryClipIngest)))
 	mux.Handle("POST /api/projects/{projectID}/perspectives", s.auth.Middleware(http.HandlerFunc(s.createPerspective)))
 	mux.Handle("PATCH /api/projects/{projectID}/perspectives/{perspectiveID}", s.auth.Middleware(http.HandlerFunc(s.patchPerspective)))
 	mux.Handle("POST /api/projects/{projectID}/tracks", s.auth.Middleware(http.HandlerFunc(s.createTrack)))
@@ -249,7 +264,7 @@ func (s *Server) probeSource(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	sourcePath := r.URL.Query().Get("path")
@@ -287,7 +302,7 @@ func (s *Server) createAssetClip(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	var req struct {
@@ -733,7 +748,7 @@ func (s *Server) triggerIngest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	ids, err := s.ingest.EnqueueProject(r.Context(), projectID)
@@ -753,12 +768,44 @@ func (s *Server) listIngestJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, rows)
 }
 
+func (s *Server) retryClipIngest(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := pathID(w, r, "projectID")
+	if !ok {
+		return
+	}
+	clipID, ok := pathID(w, r, "clipID")
+	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
+		return
+	}
+	var status string
+	if err := s.db.QueryRowContext(r.Context(), `SELECT ingest_status FROM clips WHERE id=? AND project_id=?`, clipID, projectID).Scan(&status); err != nil {
+		writeError(w, 404, err)
+		return
+	}
+	if status == "FAILED" {
+		if _, err := s.db.ExecContext(r.Context(), `UPDATE clips SET ingest_status='PENDING', updated_at=datetime('now') WHERE id=? AND project_id=?`, clipID, projectID); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		status = "PENDING"
+	}
+	ids, err := s.enqueueClipJobs(r.Context(), projectID, []int64{clipID})
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 202, map[string]any{"jobIds": ids, "ingestStatus": status})
+}
+
 func (s *Server) createPerspective(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	var req struct {
@@ -787,7 +834,7 @@ func (s *Server) patchPerspective(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	var req struct {
@@ -811,7 +858,7 @@ func (s *Server) createTrack(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	var req struct {
@@ -841,7 +888,7 @@ func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	var req struct {
@@ -879,7 +926,7 @@ func (s *Server) deleteClip(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireOwner(w, r, projectID) {
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	res, err := s.db.ExecContext(r.Context(), `DELETE FROM clips WHERE id=? AND project_id=?`, clipID, projectID)
@@ -899,6 +946,17 @@ func (s *Server) playbackManifest(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
 		return
+	}
+	etag, lastModified := s.playbackManifestValidator(r.Context(), projectID)
+	if etag != "" {
+		w.Header().Set("etag", etag)
+		if t, ok := parseSQLiteTime(lastModified); ok {
+			w.Header().Set("last-modified", t.UTC().Format(http.TimeFormat))
+		}
+		if strings.TrimSpace(r.Header.Get("if-none-match")) == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 	rows, err := s.db.QueryContext(r.Context(), `
 SELECT c.id, c.perspective_id, p.name, c.track_id, t.name, c.media_kind, c.wallclock_start_ms, c.duration_ms,
@@ -927,7 +985,7 @@ ORDER BY c.wallclock_start_ms, c.id`, projectID)
 		url := ""
 		if playlist != "" && status == "SUCCESS" {
 			var err error
-			url, err = s.hls.PublicOrSignedURL(r.Context(), storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: playlist}, s.cfg.HLSPresignTTL)
+			url, err = s.cachedHLSURL(r.Context(), storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: playlist}, s.cfg.HLSPresignTTL)
 			if err != nil {
 				writeError(w, 500, err)
 				return
@@ -936,6 +994,64 @@ ORDER BY c.wallclock_start_ms, c.id`, projectID)
 		clips = append(clips, map[string]any{"clipId": clipID, "perspectiveId": pid, "perspectiveName": pname, "trackId": tid, "trackName": tname, "kind": kind, "wallclockStartMs": start, "durationMs": dur, "fpsNum": fpsN, "fpsDen": fpsD, "streamIndex": streamIndex, "displayName": displayName, "ingestStatus": status, "hlsURL": url})
 	}
 	writeJSON(w, 200, map[string]any{"projectId": projectID, "clips": clips})
+}
+
+func (s *Server) playbackManifestValidator(ctx context.Context, projectID int64) (etag, lastModified string) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM clips WHERE project_id=?`, projectID).Scan(&count, &lastModified); err != nil {
+		return "", ""
+	}
+	var ttlBucket int64
+	if s.cfg.HLSPresignTTL > 0 {
+		ttlBucket = time.Now().Unix() / int64(s.cfg.HLSPresignTTL.Seconds())
+	}
+	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s:%d", projectID, count, lastModified, ttlBucket)))
+	return `"` + hex.EncodeToString(h[:])[:16] + `"`, lastModified
+}
+
+func (s *Server) cachedHLSURL(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
+	key := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", ref.Adapter, ref.Bucket, ref.Key, ref.Path, int64(ttl.Seconds()))
+	now := time.Now()
+	s.urlCache.mu.Lock()
+	if s.urlCache.m != nil {
+		if entry, ok := s.urlCache.m[key]; ok && now.Before(entry.expiresAt) {
+			url := entry.url
+			s.urlCache.mu.Unlock()
+			return url, nil
+		}
+	}
+	s.urlCache.mu.Unlock()
+
+	url, err := s.hls.PublicOrSignedURL(ctx, ref, ttl)
+	if err != nil {
+		return "", err
+	}
+	expiresIn := ttl - 30*time.Second
+	if expiresIn <= 0 {
+		expiresIn = ttl / 2
+	}
+	if expiresIn <= 0 {
+		expiresIn = time.Minute
+	}
+	s.urlCache.mu.Lock()
+	if s.urlCache.m == nil {
+		s.urlCache.m = make(map[string]signedURLCacheEntry)
+	}
+	s.urlCache.m[key] = signedURLCacheEntry{url: url, expiresAt: now.Add(expiresIn)}
+	s.urlCache.mu.Unlock()
+	return url, nil
+}
+
+func parseSQLiteTime(v string) (time.Time, bool) {
+	if v == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if t, err := time.ParseInLocation(layout, v, time.UTC); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
@@ -949,6 +1065,9 @@ func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createMarker(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	p, _ := auth.FromContext(r.Context())
@@ -1041,6 +1160,9 @@ func (s *Server) listRegions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createRegion(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
 		return
 	}
 	p, _ := auth.FromContext(r.Context())
@@ -1182,7 +1304,11 @@ func (s *Server) localHLS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("bad hls path"))
 		return
 	}
-	rc, err := s.hls.Open(r.Context(), storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: p})
+	ref := storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: p}
+	if info, err := s.hls.Stat(r.Context(), ref); err == nil && info.SizeBytes > 0 {
+		w.Header().Set("content-length", strconv.FormatInt(info.SizeBytes, 10))
+	}
+	rc, err := s.hls.Open(r.Context(), ref)
 	if err != nil {
 		writeError(w, 404, err)
 		return
@@ -1193,11 +1319,13 @@ func (s *Server) localHLS(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(p, ".m3u8") {
 		w.Header().Set("content-type", "application/vnd.apple.mpegurl")
-	}
-	if strings.HasSuffix(p, ".ts") {
+		w.Header().Set("cache-control", "no-cache")
+	} else if strings.HasSuffix(p, ".ts") {
 		w.Header().Set("content-type", "video/MP2T")
+		w.Header().Set("cache-control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("cache-control", "private, max-age=300")
 	}
-	w.Header().Set("cache-control", "private, max-age=300")
 	_, _ = io.Copy(w, rc)
 }
 
@@ -1210,6 +1338,28 @@ func (s *Server) requireOwner(w http.ResponseWriter, r *http.Request, projectID 
 	}
 	if owner != p.Username {
 		writeError(w, 403, errors.New("project owner required"))
+		return false
+	}
+	return true
+}
+
+func (s *Server) requireProjectEditor(w http.ResponseWriter, r *http.Request, projectID int64) bool {
+	p, _ := auth.FromContext(r.Context())
+	var allowed int
+	err := s.db.QueryRowContext(r.Context(), `
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+  FROM projects p
+  LEFT JOIN project_memberships pm ON pm.project_id=p.id AND pm.username=?
+  WHERE p.id=?
+    AND (p.owner_username=? OR pm.role IN ('owner','editor','member'))
+) THEN 1 ELSE 0 END`, p.Username, projectID, p.Username).Scan(&allowed)
+	if err != nil {
+		writeError(w, 500, err)
+		return false
+	}
+	if allowed != 1 {
+		writeError(w, 403, errors.New("project membership required"))
 		return false
 	}
 	return true
@@ -1373,6 +1523,6 @@ func logging(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		log.Printf("http %s %s status=%d bytes=%d duration=%s", r.Method, r.URL.Path, status, recorder.bytes, time.Since(start))
+		slog.InfoContext(r.Context(), "http request", "method", r.Method, "uri", r.URL.RequestURI(), "status", status, "bytes", recorder.bytes, "duration_ms", time.Since(start).Milliseconds())
 	})
 }
