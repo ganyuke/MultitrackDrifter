@@ -1,0 +1,9 @@
+.env
+*.db
+*.db-*
+/bin
+/web/node_modules
+/web/dist
+/tmp
+/storage
+.DS_Store
