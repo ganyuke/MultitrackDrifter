@@ -174,6 +174,25 @@ CREATE INDEX IF NOT EXISTS idx_clips_project_ingest_status ON clips(project_id, 
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_project_state_clip ON ingest_jobs(project_id, state, clip_id, id);
 `}, {3, `
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_state_id ON ingest_jobs(state, id);
+`}, {4, `
+WITH ranked_active_jobs AS (
+  SELECT
+    id,
+    ROW_NUMBER() OVER (
+      PARTITION BY project_id, clip_id
+      ORDER BY CASE state WHEN 'PROCESSING' THEN 0 ELSE 1 END, id
+    ) AS rn
+  FROM ingest_jobs
+  WHERE state IN ('PENDING','PROCESSING')
+)
+UPDATE ingest_jobs
+SET state='FAILED',
+    error='superseded by another active ingest job during uniqueness migration',
+    finished_at=datetime('now')
+WHERE id IN (SELECT id FROM ranked_active_jobs WHERE rn > 1);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_jobs_one_active_per_clip
+ON ingest_jobs(project_id, clip_id)
+WHERE state IN ('PENDING','PROCESSING');
 `}}
 
 func Migrate(ctx context.Context, db *sql.DB) error {

@@ -680,11 +680,13 @@ LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), arg
 			continue
 		}
 
-		res, err := s.db.ExecContext(ctx, `INSERT INTO ingest_jobs(project_id, clip_id, state) VALUES (?, ?, 'PENDING')`, projectID, clipID)
+		jobID, err := s.insertPendingIngestJob(ctx, projectID, clipID)
 		if err != nil {
 			return nil, err
 		}
-		jobID, _ := res.LastInsertId()
+		if jobID == 0 {
+			continue
+		}
 		jobIDs = append(jobIDs, jobID)
 		p.activeJobID = jobID
 		plans[clipID] = p
@@ -693,6 +695,37 @@ LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), arg
 		s.ingest.Notify()
 	}
 	return jobIDs, nil
+}
+
+func (s *Server) insertPendingIngestJob(ctx context.Context, projectID, clipID int64) (int64, error) {
+	var jobID int64
+	err := s.db.QueryRowContext(ctx, `
+INSERT OR IGNORE INTO ingest_jobs(project_id, clip_id, state)
+VALUES (?, ?, 'PENDING')
+RETURNING id`, projectID, clipID).Scan(&jobID)
+	if err == nil {
+		return jobID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+
+	// A concurrent request may have inserted the active job after our batched
+	// preflight query. The partial unique index makes that race harmless; return
+	// the existing/latest job ID so the caller can report stable status.
+	err = s.db.QueryRowContext(ctx, `
+SELECT id
+FROM ingest_jobs
+WHERE project_id=? AND clip_id=?
+ORDER BY CASE WHEN state IN ('PENDING','PROCESSING') THEN 0 ELSE 1 END, id DESC
+LIMIT 1`, projectID, clipID).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return jobID, nil
 }
 
 func (s *Server) triggerIngest(w http.ResponseWriter, r *http.Request) {

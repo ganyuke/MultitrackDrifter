@@ -113,18 +113,11 @@ func (w *Worker) EnqueueProject(ctx context.Context, projectID int64) ([]int64, 
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, `
-INSERT INTO ingest_jobs(project_id, clip_id, state)
+INSERT OR IGNORE INTO ingest_jobs(project_id, clip_id, state)
 SELECT c.project_id, c.id, 'PENDING'
 FROM clips c
 WHERE c.project_id=?
   AND c.ingest_status IN ('PENDING','FAILED')
-  AND NOT EXISTS (
-    SELECT 1
-    FROM ingest_jobs j
-    WHERE j.project_id=c.project_id
-      AND j.clip_id=c.id
-      AND j.state IN ('PENDING','PROCESSING')
-  )
 ORDER BY c.id
 RETURNING id, clip_id`, projectID)
 	if err != nil {
