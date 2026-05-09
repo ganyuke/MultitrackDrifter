@@ -54,7 +54,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer database.Close()
-	source, hls, err := stores(cfg)
+	source, hls, err := stores(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -73,7 +73,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	return srv.ListenAndServe()
 }
 
-func stores(cfg config.Config) (storage.SourceStore, storage.HLSStore, error) {
+func stores(ctx context.Context, cfg config.Config) (storage.SourceStore, storage.HLSStore, error) {
 	var source storage.SourceStore
 	var hls storage.HLSStore
 	switch cfg.SourceAdapter {
@@ -84,7 +84,15 @@ func stores(cfg config.Config) (storage.SourceStore, storage.HLSStore, error) {
 		}
 		source = s
 	case "s3":
-		s, err := s3store.NewSourceFromEnv()
+		s, err := s3store.NewSource(ctx, s3store.S3Config{
+			Endpoint:     cfg.SourceS3.Endpoint,
+			Region:       cfg.SourceS3.Region,
+			Bucket:       cfg.SourceS3.Bucket,
+			AccessKey:    cfg.SourceS3.AccessKey,
+			SecretKey:    cfg.SourceS3.SecretKey,
+			SessionToken: cfg.SourceS3.SessionToken,
+			Root:         cfg.SourceS3.Root,
+		})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -100,7 +108,15 @@ func stores(cfg config.Config) (storage.SourceStore, storage.HLSStore, error) {
 		}
 		hls = h
 	case "s3":
-		h, err := s3store.NewHLSFromEnv()
+		h, err := s3store.NewHLS(ctx, s3store.S3Config{
+			Endpoint:     cfg.HLSAdapterS3.Endpoint,
+			Region:       cfg.HLSAdapterS3.Region,
+			Bucket:       cfg.HLSAdapterS3.Bucket,
+			AccessKey:    cfg.HLSAdapterS3.AccessKey,
+			SecretKey:    cfg.HLSAdapterS3.SecretKey,
+			SessionToken: cfg.HLSAdapterS3.SessionToken,
+			Root:         cfg.HLSAdapterS3.Root,
+		})
 		if err != nil {
 			return nil, nil, err
 		}

@@ -28,6 +28,7 @@ type SourceStore interface {
 	List(ctx context.Context, prefix string, delimiter string) ([]ObjectInfo, error)
 	Open(ctx context.Context, ref ObjectRef) (io.ReadCloser, error)
 	Stat(ctx context.Context, ref ObjectRef) (ObjectInfo, error)
+	PresignRead(ctx context.Context, ref ObjectRef, ttl time.Duration) (string, error)
 }
 
 type HLSStore interface {

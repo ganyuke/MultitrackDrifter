@@ -20,10 +20,12 @@ type Config struct {
 	LDAP              LDAPConfig
 	SourceAdapter     string
 	SourceLocalRoot   string
+	SourceS3          S3Config
 	HLSAdapter        string
 	HLSLocalRoot      string
 	HLSLocalURLPrefix string
 	HLSPresignTTL     time.Duration
+	HLSAdapterS3      S3Config
 	FFmpegBin         string
 	FFprobeBin        string
 	TranscodeProfile  string
@@ -41,6 +43,16 @@ type LDAPConfig struct {
 	UserFilter    string
 	GroupBaseDN   string
 	CreatorGroups []string
+}
+
+type S3Config struct {
+	Endpoint     string
+	Region       string
+	Bucket       string
+	AccessKey    string
+	SecretKey    string
+	SessionToken string
+	Root         string
 }
 
 func Load() (Config, error) {
@@ -75,6 +87,24 @@ func Load() (Config, error) {
 		UserFilter:    getenv("LDAP_USER_FILTER", "(uid=%s)"),
 		GroupBaseDN:   getenv("LDAP_GROUP_BASE_DN", ""),
 		CreatorGroups: splitCSV(getenv("LDAP_CREATOR_GROUPS", "")),
+	}
+	cfg.SourceS3 = S3Config{
+		Endpoint:     getenv("SOURCE_S3_ENDPOINT", ""),
+		Region:       getenv("SOURCE_S3_REGION", "us-east-1"),
+		Bucket:       getenv("SOURCE_S3_BUCKET", ""),
+		AccessKey:    getenv("SOURCE_S3_ACCESS_KEY", ""),
+		SecretKey:    getenv("SOURCE_S3_SECRET_KEY", ""),
+		SessionToken: getenv("SOURCE_S3_SESSION_TOKEN", ""),
+		Root:         getenv("SOURCE_S3_ROOT", ""),
+	}
+	cfg.HLSAdapterS3 = S3Config{
+		Endpoint:     getenv("HLS_S3_ENDPOINT", ""),
+		Region:       getenv("HLS_S3_REGION", "us-east-1"),
+		Bucket:       getenv("HLS_S3_BUCKET", ""),
+		AccessKey:    getenv("HLS_S3_ACCESS_KEY", ""),
+		SecretKey:    getenv("HLS_S3_SECRET_KEY", ""),
+		SessionToken: getenv("HLS_S3_SESSION_TOKEN", ""),
+		Root:         getenv("HLS_S3_ROOT", ""),
 	}
 	if len(cfg.CookieSecret) < 32 {
 		return Config{}, fmt.Errorf("COOKIE_SECRET must be at least 32 bytes")

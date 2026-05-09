@@ -75,6 +75,15 @@ func (s *Source) Stat(ctx context.Context, ref storage.ObjectRef) (storage.Objec
 	return statLocal(ctx, s.root, "local", ref.Path)
 }
 
+func (s *Source) PresignRead(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
+	_ = ttl
+	p, err := resolveUnderRoot(s.root, ref.Path)
+	if err != nil {
+		return "", err
+	}
+	return "file://" + p, nil
+}
+
 func (h *HLS) Put(ctx context.Context, ref storage.ObjectRef, r io.Reader, contentType string) error {
 	_ = contentType
 	select {

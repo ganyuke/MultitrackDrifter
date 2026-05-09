@@ -27,7 +27,6 @@ import (
 	"github.com/example/multitrack-drifter/internal/ingest"
 	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
-	"github.com/example/multitrack-drifter/internal/storage/localstore"
 )
 
 type Server struct {
@@ -287,14 +286,12 @@ func (s *Server) probeSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) probeSourcePath(ctx context.Context, sourcePath string) (ff.Probe, error) {
-	if local, ok := s.source.(*localstore.Source); ok {
-		input, err := local.ResolvePath(sourcePath)
-		if err != nil {
-			return ff.Probe{}, err
-		}
-		return ff.Runner{FFmpeg: s.cfg.FFmpegBin, FFprobe: s.cfg.FFprobeBin}.Probe(ctx, input)
+	ref := storage.ObjectRef{Adapter: s.cfg.SourceAdapter, Path: sourcePath}
+	url, err := s.source.PresignRead(ctx, ref, 10*time.Minute)
+	if err != nil {
+		return ff.Probe{}, fmt.Errorf("presign read: %w", err)
 	}
-	return ff.Probe{}, errors.New("source probing for non-local adapters is not implemented in this POC; S3 support needs presigned ffprobe input")
+	return ff.Runner{FFmpeg: s.cfg.FFmpegBin, FFprobe: s.cfg.FFprobeBin}.Probe(ctx, url)
 }
 
 func (s *Server) createAssetClip(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -388,13 +389,32 @@ func (w *Worker) inputPath(ctx context.Context, sourcePath string) (string, erro
 	if local, ok := w.source.(*localstore.Source); ok {
 		return local.ResolvePath(sourcePath)
 	}
-	// S3-compatible stores should return presigned HTTP(S) source URLs in a full implementation.
 	rc, err := w.source.Open(ctx, storage.ObjectRef{Adapter: w.cfg.SourceAdapter, Path: sourcePath})
 	if err != nil {
 		return "", err
 	}
 	defer rc.Close()
-	return "", fmt.Errorf("non-local source ingest is not wired in this POC; source open returned %T", rc)
+	tmp, err := os.MkdirTemp("", "drifter-source-*")
+	if err != nil {
+		return "", err
+	}
+	tmpFile := tmp + "/source"
+	f, err := os.Create(tmpFile)
+	if err != nil {
+		os.RemoveAll(tmp)
+		return "", err
+	}
+	_, copyErr := io.Copy(f, rc)
+	closeErr := f.Close()
+	if closeErr != nil {
+		os.RemoveAll(tmp)
+		return "", closeErr
+	}
+	if copyErr != nil {
+		os.RemoveAll(tmp)
+		return "", copyErr
+	}
+	return tmpFile, nil
 }
 
 func (w *Worker) uploadHLSDirectory(ctx context.Context, tmp, assetPath string) error {
