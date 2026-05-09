@@ -86,7 +86,7 @@
   $: allClips = manifest.clips || [];
   $: videoClips = allClips.filter(c => c.kind === 'video');
   $: audioClips = allClips.filter(c => c.kind === 'audio');
-  $: perspectiveGroups = buildPerspectiveGroups(allClips, perspectiveOrder, trackOrder, collapsedPerspectiveIds, hiddenPerspectiveIds);
+  $: perspectiveGroups = buildPerspectiveGroups(allClips, perspectiveOrder, trackOrder, collapsedPerspectiveIds, hiddenPerspectiveIds, visibleTrackIds, activeAudioIds);
   $: trackRows = flattenTimelineRows(perspectiveGroups);
   $: monitorCells = buildMonitorCells(perspectiveGroups, visibleTrackIds, hiddenPerspectiveIds, wallclockMs).slice(0, maxCells(gridPreset));
   $: visibleVideos = monitorCells.map(cell => cell.activeClip).filter(Boolean);
@@ -1004,15 +1004,13 @@
     persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
   }
 
-  function groupViewEnabled(group) { return !hiddenPerspectiveIds.includes(group.id) && group.videoTracks.some(t => hasId(visibleTrackIds, t.id)); }
-  function groupAudioEnabled(group) { return group.audioTracks.some(t => hasId(activeAudioIds, t.id)); }
 
   async function togglePerspectiveAudio(group) {
     playbackToken += 1;
     const ids = group.audioTracks.map(t => t.id);
     if (!ids.length) return;
     const enabled = ids.filter(id => hasId(activeAudioIds, id));
-    if (groupAudioEnabled(group)) {
+    if (enabled.length > 0) {
       rememberedPerspectiveAudioIds = { ...rememberedPerspectiveAudioIds, [group.id]: enabled };
       activeAudioIds = removeIds(activeAudioIds, ids);
       ids.forEach(disableTrackMedia);
@@ -1075,7 +1073,7 @@
     return next;
   }
 
-  function buildPerspectiveGroups(clips, orderedP = [], orderedT = [], collapsedIds = [], hiddenIds = []) {
+  function buildPerspectiveGroups(clips, orderedP = [], orderedT = [], collapsedIds = [], hiddenIds = [], enabledVideoTrackIds = [], enabledAudioTrackIds = []) {
     const groups = new Map();
     for (const clip of clips) {
       const pk = perspectiveKey(clip);
@@ -1093,6 +1091,8 @@
       g.audioTracks = g.tracks.filter(t => t.kind === 'audio');
       g.collapsed = collapsedIds.includes(g.id);
       g.hidden = hiddenIds.includes(g.id);
+      g.viewEnabled = !g.hidden && g.videoTracks.some(t => hasId(enabledVideoTrackIds, t.id));
+      g.audioEnabled = g.audioTracks.some(t => hasId(enabledAudioTrackIds, t.id));
       return g;
     });
   }
@@ -1604,8 +1604,8 @@
                     <button class="collapse-btn" onclick={() => togglePerspectiveCollapse(row.id)}>{row.group.collapsed ? '▸' : '▾'}</button>
                     <button class="persp-name-btn" title="Dbl-click to rename" ondblclick={() => startRename('perspective', row.id, row.perspectiveName)}>{row.perspectiveName}</button>
                     <div class="persp-toggles">
-                      <button class="toggle-btn {groupViewEnabled(row.group) ? 'tog-v-on' : ''}" title="Show/hide in grid" onclick={() => togglePerspectiveView(row.group)}>V</button>
-                      <button class="toggle-btn {groupAudioEnabled(row.group) ? 'tog-a-on' : ''}" title="Enable/disable audio" onclick={() => togglePerspectiveAudio(row.group)}>A</button>
+                      <button class="toggle-btn {row.group.viewEnabled ? 'tog-v-on' : ''}" aria-pressed={row.group.viewEnabled} title="Show/hide in grid" onclick={() => togglePerspectiveView(row.group)}>V</button>
+                      <button class="toggle-btn {row.group.audioEnabled ? 'tog-a-on' : ''}" aria-pressed={row.group.audioEnabled} title="Enable/disable audio" onclick={() => togglePerspectiveAudio(row.group)}>A</button>
                     </div>
                   </div>
                 </div>
