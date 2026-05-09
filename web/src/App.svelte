@@ -252,7 +252,7 @@
     importPerspective = inferPerspective(path);
     importStreams = (importProbe.streams || []).map((stream) => ({
       ...stream, selected: true,
-      track: `${importPerspective} / ${stream.label || (stream.kind === 'audio' ? 'Audio' : 'Video')}`,
+      track: stream.label || (stream.kind === 'audio' ? 'Audio' : 'Video'),
       displayName: `${path.split('/').pop()} - ${stream.label || stream.kind}`
     }));
   }

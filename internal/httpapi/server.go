@@ -363,7 +363,7 @@ func (s *Server) createAssetClip(w http.ResponseWriter, r *http.Request) {
 	for _, st := range streams {
 		track := strings.TrimSpace(st.Track)
 		if track == "" {
-			track = req.Perspective + " / " + defaultStreamTrackName(st)
+			track = defaultStreamTrackName(st)
 		}
 		displayName := strings.TrimSpace(st.DisplayName)
 		if displayName == "" {
