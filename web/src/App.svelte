@@ -410,14 +410,16 @@
   }
 
   async function moveClipTo(clip, startMs) {
-    await moveClipStarts({ [clip.clipId]: Math.max(0, Math.round(startMs)) });
+    const plan = movementPlanFor(clip);
+    const start = Math.max(0, Math.round(startMs));
+    const starts = {};
+    for (const item of plan.movingClips) starts[item.clipId] = start;
+    await moveClipStarts(starts);
   }
 
   async function moveClip(clip, delta) {
-    const clips = movementClipSetFor(clip);
-    const starts = {};
-    for (const item of clips) starts[item.clipId] = item.wallclockStartMs + delta;
-    await moveClipStarts(starts);
+    const plan = movementPlanFor(clip);
+    await moveClipStarts(startsForMovementDelta(plan, delta));
   }
 
   async function moveClipStarts(startsById) {
@@ -425,10 +427,11 @@
     const entries = Object.entries(startsById)
       .map(([id, start]) => [id, Math.max(0, Math.round(Number(start)))])
       .filter(([id, start]) => Number.isFinite(start) && allClips.some(c => String(c.clipId) === String(id) && Math.round(c.wallclockStartMs) !== start));
-    for (const [id, start] of entries) {
-      await patchJSON(`/api/projects/${current.id}/clips/${id}`, { wallclockStartMs: start });
-    }
-    if (entries.length) await refreshProject();
+    if (!entries.length) return;
+    await patchJSON(`/api/projects/${current.id}/clips`, {
+      updates: entries.map(([clipId, wallclockStartMs]) => ({ clipId: Number(clipId), wallclockStartMs }))
+    });
+    await refreshProject();
   }
 
   function selectClip(clip, event = null) {
@@ -470,6 +473,37 @@
     return allClips.filter(c => ids.has(String(c.clipId)));
   }
 
+  function movementPlanFor(anchor) {
+    const movingClips = movementClipSetFor(anchor);
+    const originalStarts = Object.fromEntries(movingClips.map(c => [c.clipId, c.wallclockStartMs]));
+    const baseStarts = { ...originalStarts };
+    if (linkedMoveEnabled) {
+      const groupBaseStarts = {};
+      const setGroupBase = (groupId, start) => {
+        if (!groupId || Object.prototype.hasOwnProperty.call(groupBaseStarts, groupId)) return;
+        groupBaseStarts[groupId] = start;
+      };
+      if (anchor?.linkGroupId) groupBaseStarts[anchor.linkGroupId] = originalStarts[anchor.clipId] ?? anchor.wallclockStartMs;
+      for (const clip of movingClips) {
+        if (!clip.linkGroupId) continue;
+        const selectedInGroup = movingClips.find(c => c.linkGroupId === clip.linkGroupId && hasId(selectedClipIds, c.clipId));
+        setGroupBase(clip.linkGroupId, originalStarts[selectedInGroup?.clipId ?? clip.clipId]);
+      }
+      for (const clip of movingClips) {
+        if (clip.linkGroupId && Object.prototype.hasOwnProperty.call(groupBaseStarts, clip.linkGroupId)) {
+          baseStarts[clip.clipId] = groupBaseStarts[clip.linkGroupId];
+        }
+      }
+    }
+    return { movingClips, originalStarts, baseStarts };
+  }
+
+  function startsForMovementDelta(plan, delta) {
+    const starts = {};
+    for (const item of plan.movingClips) starts[item.clipId] = Math.max(0, Math.round((plan.baseStarts[item.clipId] ?? item.wallclockStartMs) + delta));
+    return starts;
+  }
+
   function dragOriginalStart(clip) { return dragState?.originalStarts?.[clip.clipId] ?? clip.wallclockStartMs; }
   function dragPreviewStart(clip) { return dragState?.previewStarts?.[clip.clipId] ?? clip.wallclockStartMs; }
   function isClipDragging(clip) { return !!dragState?.clipIds?.some(id => String(id) === String(clip.clipId)); }
@@ -486,9 +520,9 @@
     return targets.filter(Number.isFinite);
   }
 
-  function snapDragDelta(rawDelta, movingClips, originalStarts) {
+  function snapDragDelta(rawDelta, movingClips, baseStarts) {
     let delta = rawDelta;
-    const minStart = Math.min(...movingClips.map(c => originalStarts[c.clipId]));
+    const minStart = Math.min(...movingClips.map(c => baseStarts[c.clipId]));
     delta = Math.max(delta, -minStart);
     if (!snapEnabled) return delta;
     const ids = movingClips.map(c => c.clipId);
@@ -496,7 +530,7 @@
     const thresholdMs = Math.max(40, Math.round((10 / Math.max(1, timelineLaneWidthPx)) * timelineEndMs));
     let best = { distance: Infinity, delta };
     for (const clip of movingClips) {
-      const start = originalStarts[clip.clipId];
+      const start = baseStarts[clip.clipId];
       const end = start + Math.max(0, clip.durationMs || 0);
       for (const target of targets) {
         for (const candidate of [target - start, target - end]) {
@@ -775,21 +809,28 @@
 
   function startClipDrag(event, clip) {
     event.preventDefault(); event.stopPropagation();
-    selectClip(clip, event);
+    const multi = !!(event.shiftKey || event.metaKey || event.ctrlKey);
+    if (!multi && isClipSelected(clip)) {
+      selectedClipId = clip.clipId;
+      activeInspectorTab = 'clip';
+      persistPrefs();
+    } else {
+      selectClip(clip, event);
+    }
     if (!isProjectOwner()) return;
     event.currentTarget?.setPointerCapture?.(event.pointerId);
     document.body.classList.add('dragging-timeline');
-    const movingClips = movementClipSetFor(clip);
-    const originalStarts = Object.fromEntries(movingClips.map(c => [c.clipId, c.wallclockStartMs]));
-    dragState = { clipId: clip.clipId, clipIds: movingClips.map(c => c.clipId), originalStarts, previewStarts: { ...originalStarts }, pointerStartMs: clientToTimelineMs(event.clientX), moved: false };
+    const plan = movementPlanFor(clip);
+    const { movingClips, originalStarts, baseStarts } = plan;
+    dragState = { clipId: clip.clipId, clipIds: movingClips.map(c => c.clipId), originalStarts, baseStarts, previewStarts: { ...originalStarts }, pointerStartMs: clientToTimelineMs(event.clientX), moved: false };
     const move = (ev) => {
       ev.preventDefault();
       if (!dragState) return;
       const rawDelta = clientToTimelineMs(ev.clientX) - dragState.pointerStartMs;
-      const delta = snapDragDelta(rawDelta, movingClips, originalStarts);
-      const previewStarts = {};
-      for (const item of movingClips) previewStarts[item.clipId] = Math.max(0, Math.round(originalStarts[item.clipId] + delta));
-      dragState = { ...dragState, previewStarts, moved: Math.abs(delta) >= 1 };
+      const delta = snapDragDelta(rawDelta, movingClips, baseStarts);
+      const previewStarts = startsForMovementDelta(plan, delta);
+      const moved = Object.entries(previewStarts).some(([id, start]) => Math.abs(start - (originalStarts[id] ?? 0)) >= 1);
+      dragState = { ...dragState, previewStarts, moved };
       wallclockMs = previewStarts[clip.clipId] ?? wallclockMs;
     };
     const up = async () => {
@@ -1635,6 +1676,7 @@
                 <p class="muted">Linked A/V is enabled, so matching video/audio clips move together.</p>
               {/if}
               <div class="nudge-grid">
+                <button class="nudge-btn nudge-wide" onclick={() => moveClipTo(selectedClip, wallclockMs)} disabled={!isProjectOwner()} title="Move selected clips so they all start at the current playhead time">Align to Playhead</button>
                 <button class="nudge-btn" onclick={() => moveClip(selectedClip, -1000)} disabled={!isProjectOwner()}>−1s</button>
                 <button class="nudge-btn" onclick={() => moveClip(selectedClip, -100)} disabled={!isProjectOwner()}>−100ms</button>
                 <button class="nudge-btn" onclick={() => moveClip(selectedClip, 100)} disabled={!isProjectOwner()}>+100ms</button>

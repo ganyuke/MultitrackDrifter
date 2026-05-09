@@ -79,6 +79,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/projects/{projectID}/perspectives", s.auth.Middleware(http.HandlerFunc(s.createPerspective)))
 	mux.Handle("PATCH /api/projects/{projectID}/perspectives/{perspectiveID}", s.auth.Middleware(http.HandlerFunc(s.patchPerspective)))
 	mux.Handle("POST /api/projects/{projectID}/tracks", s.auth.Middleware(http.HandlerFunc(s.createTrack)))
+	mux.Handle("PATCH /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.patchClips)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.patchClip)))
 	mux.Handle("DELETE /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.deleteClip)))
 	mux.Handle("GET /api/projects/{projectID}/playback-manifest", s.auth.Middleware(http.HandlerFunc(s.playbackManifest)))
@@ -902,6 +903,75 @@ func (s *Server) createTrack(w http.ResponseWriter, r *http.Request) {
 	}
 	id, _ := res.LastInsertId()
 	writeJSON(w, 201, map[string]any{"id": id})
+}
+
+func (s *Server) patchClips(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := pathID(w, r, "projectID")
+	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
+		return
+	}
+	var req struct {
+		Updates []struct {
+			ClipID           int64 `json:"clipId"`
+			WallclockStartMS int64 `json:"wallclockStartMs"`
+		} `json:"updates"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	if len(req.Updates) == 0 {
+		writeError(w, 400, errors.New("at least one clip update is required"))
+		return
+	}
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	updates := make([]map[string]any, 0, len(req.Updates))
+	seen := map[int64]bool{}
+	for _, update := range req.Updates {
+		if update.ClipID <= 0 {
+			writeError(w, 400, errors.New("clipId must be positive"))
+			return
+		}
+		if seen[update.ClipID] {
+			continue
+		}
+		seen[update.ClipID] = true
+		start := update.WallclockStartMS
+		if start < 0 {
+			start = 0
+		}
+		res, err := tx.ExecContext(r.Context(), `UPDATE clips SET wallclock_start_ms=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, start, update.ClipID, projectID)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		if rows == 0 {
+			writeError(w, 404, fmt.Errorf("clip %d not found", update.ClipID))
+			return
+		}
+		updates = append(updates, map[string]any{"clipId": update.ClipID, "wallclockStartMs": start})
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	s.broadcast(r, projectID, "clip.timeline.batch_updated", map[string]any{"updates": updates})
+	writeJSON(w, 200, map[string]any{"updates": updates})
 }
 
 func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {

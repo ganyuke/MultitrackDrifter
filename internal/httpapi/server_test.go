@@ -3,12 +3,17 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/example/multitrack-drifter/internal/auth"
 	"github.com/example/multitrack-drifter/internal/config"
 	dbpkg "github.com/example/multitrack-drifter/internal/db"
 	"github.com/example/multitrack-drifter/internal/ingest"
+	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
 )
 
@@ -207,6 +212,64 @@ func TestCreateSourceRevisionClipsLinksStreamsFromSameImport(t *testing.T) {
 	}
 }
 
+func TestPatchClipsUpdatesStartsInOneRequest(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ctx)
+
+	projectID := insertTestProject(t, ctx, db)
+	info := storage.ObjectInfo{
+		Name:      "camera-d.mp4",
+		SizeBytes: 256,
+		ETag:      "etag-d",
+		Ref: storage.ObjectRef{
+			Adapter: "local",
+			Path:    "camera-d.mp4",
+		},
+	}
+	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile"}, hub: realtime.NewHub()}
+	clipIDs, _, _, err := s.createSourceRevisionClips(ctx, projectID, []createClipReq{
+		{Perspective: "Main", Track: "Video", Kind: "video", DisplayName: "Camera D video", StreamIndex: 0, WallclockStartMS: 1000},
+		{Perspective: "Main", Track: "Audio", Kind: "audio", DisplayName: "Camera D audio", StreamIndex: 1, WallclockStartMS: 2000},
+	}, info)
+	if err != nil {
+		t.Fatalf("createSourceRevisionClips: %v", err)
+	}
+	if len(clipIDs) != 2 {
+		t.Fatalf("expected two clips, got %v", clipIDs)
+	}
+
+	body := strings.NewReader(`{"updates":[{"clipId":` + itoa(clipIDs[0]) + `,"wallclockStartMs":7000},{"clipId":` + itoa(clipIDs[1]) + `,"wallclockStartMs":7000}]}`)
+	req := httptest.NewRequest("PATCH", "/api/projects/1/clips", body)
+	req.SetPathValue("projectID", itoa(projectID))
+	req = req.WithContext(context.WithValue(req.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#abcdef"}))
+	rr := httptest.NewRecorder()
+
+	s.patchClips(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("patchClips status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT wallclock_start_ms FROM clips WHERE project_id=? ORDER BY id`, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var starts []int64
+	for rows.Next() {
+		var start int64
+		if err := rows.Scan(&start); err != nil {
+			t.Fatal(err)
+		}
+		starts = append(starts, start)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(starts) != 2 || starts[0] != 7000 || starts[1] != 7000 {
+		t.Fatalf("expected both clips at 7000ms, got %#v", starts)
+	}
+}
+
 func openTestDB(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	db, err := dbpkg.Open(ctx, filepath.Join(t.TempDir(), "drifter-test.db"))
@@ -269,3 +332,5 @@ func insertTestHLSAsset(t *testing.T, ctx context.Context, db *sql.DB, revID int
 	}
 	return hlsID
 }
+
+func itoa(v int64) string { return fmt.Sprintf("%d", v) }
