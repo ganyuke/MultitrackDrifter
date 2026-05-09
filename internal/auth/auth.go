@@ -55,6 +55,12 @@ func (s *Service) Login(ctx context.Context, username, password string) (Princip
 		}
 	}
 	color := colorFor(username)
+	// Preserve any user-chosen color; only set default on first login.
+	var existingColor string
+	_ = s.db.QueryRowContext(ctx, `SELECT color FROM users WHERE username=?`, username).Scan(&existingColor)
+	if existingColor != "" {
+		color = existingColor
+	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO users(username, display_name, color, can_create_projects, updated_at)
 VALUES (?, ?, ?, ?, datetime('now'))
@@ -63,15 +69,17 @@ ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, can_crea
 	if err != nil {
 		return Principal{}, "", err
 	}
-	principal, token, err := s.createSession(ctx, username, display, color, canCreate)
+	principal, token, err := s.createSession(ctx, username)
 	if err != nil {
 		return Principal{}, "", err
 	}
+	principal.DisplayName = display
+	principal.Color = color
+	principal.CanCreateProjects = canCreate
 	return principal, token, nil
 }
 
 func (s *Service) ldapAuthenticate(username, password string) (string, bool, error) {
-	// Some LDAP servers allow unauthenticated binds with an empty password; never treat that as login.
 	if password == "" {
 		return "", false, errors.New("invalid credentials")
 	}
@@ -113,7 +121,9 @@ func (s *Service) ldapAuthenticate(username, password string) (string, bool, err
 	return display, canCreate, nil
 }
 
-func (s *Service) createSession(ctx context.Context, username, display, color string, canCreate bool) (Principal, string, error) {
+// createSession inserts a new session row. User metadata is NOT stored in sessions —
+// it is always joined from the users table at lookup time to stay fresh.
+func (s *Service) createSession(ctx context.Context, username string) (Principal, string, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
 		return Principal{}, "", err
@@ -121,11 +131,11 @@ func (s *Service) createSession(ctx context.Context, username, display, color st
 	token := hex.EncodeToString(bytes)
 	expires := time.Now().Add(s.cfg.SessionTTL).UTC()
 	hash := s.tokenHash(token)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions(token_hash, username, display_name, user_color, can_create_projects, expires_at) VALUES (?, ?, ?, ?, ?, ?)`, hash, username, display, color, boolInt(canCreate), expires.Format(time.RFC3339))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions(token_hash, username, expires_at) VALUES (?, ?, ?)`, hash, username, expires.Format(time.RFC3339))
 	if err != nil {
 		return Principal{}, "", err
 	}
-	return Principal{Username: username, DisplayName: display, Color: color, CanCreateProjects: canCreate, ExpiresAt: expires.Format(time.RFC3339)}, token, nil
+	return Principal{Username: username, ExpiresAt: expires.Format(time.RFC3339)}, token, nil
 }
 
 func (s *Service) PrincipalFromRequest(r *http.Request) (Principal, error) {
@@ -136,10 +146,16 @@ func (s *Service) PrincipalFromRequest(r *http.Request) (Principal, error) {
 	return s.PrincipalFromToken(r.Context(), cookie.Value)
 }
 
+// PrincipalFromToken loads the session and joins the current user row so we always
+// return live display_name/color/can_create_projects rather than a stale cached copy.
 func (s *Service) PrincipalFromToken(ctx context.Context, token string) (Principal, error) {
 	var p Principal
 	var canInt int
-	err := s.db.QueryRowContext(ctx, `SELECT username, display_name, user_color, can_create_projects, expires_at FROM sessions WHERE token_hash = ?`, s.tokenHash(token)).Scan(&p.Username, &p.DisplayName, &p.Color, &canInt, &p.ExpiresAt)
+	err := s.db.QueryRowContext(ctx, `
+SELECT s.username, u.display_name, u.color, u.can_create_projects, s.expires_at
+FROM sessions s
+JOIN users u ON u.username = s.username
+WHERE s.token_hash = ?`, s.tokenHash(token)).Scan(&p.Username, &p.DisplayName, &p.Color, &canInt, &p.ExpiresAt)
 	if err != nil {
 		return Principal{}, err
 	}
@@ -191,19 +207,8 @@ func (s *Service) SetColor(ctx context.Context, username, color string) error {
 	if !ok {
 		return errors.New("color not in accessible palette")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET color = ?, updated_at = datetime('now') WHERE username = ?`, canonical, username); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET user_color = ? WHERE username = ?`, canonical, username); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET color = ?, updated_at = datetime('now') WHERE username = ?`, canonical, username)
+	return err
 }
 
 func (s *Service) WriteSessionCookie(w http.ResponseWriter, token string) {
@@ -232,11 +237,6 @@ func CanonicalColor(color string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func validColor(color string) bool {
-	_, ok := CanonicalColor(color)
-	return ok
 }
 
 func containsAnyDN(haystack, needles []string) bool {

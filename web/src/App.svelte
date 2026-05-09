@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { api, postJSON, patchJSON, del } from './api.js';
+  import { api, postJSON, patchJSON, del, deleteJSON } from './api.js';
   import { attachHLS, clipLocalSeconds, fitVideoToCell, loadPrefs, savePrefs } from './playback.js';
 
   let me = null;
@@ -159,12 +159,14 @@
   }
 
   async function openProject(id) {
-    current = await api(`/api/projects/${id}`);
-    manifest = await api(`/api/projects/${id}/playback-manifest`);
+    // Single round-trip replaces: project + playback-manifest + markers + regions + members
+    const state = await api(`/api/projects/${id}/state`);
+    current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
+    manifest = { clips: state.clips || [] };
+    markers = state.markers || [];
+    regions = state.regions || [];
+    members = state.members || [];
     reconcileOrdering();
-    markers = await api(`/api/projects/${id}/markers`);
-    regions = await api(`/api/projects/${id}/regions`);
-    await refreshMembers();
     const prefs = loadPrefs(id);
     gridPreset = prefs.gridPreset || '2x2';
     perspectiveOrder = prefs.perspectiveOrder || [];
@@ -194,13 +196,14 @@
   async function refreshProject() {
     if (!current) return;
     const id = current.id;
-    current = await api(`/api/projects/${id}`);
-    manifest = await api(`/api/projects/${id}/playback-manifest`);
+    const state = await api(`/api/projects/${id}/state`);
+    current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
+    manifest = { clips: state.clips || [] };
+    markers = state.markers || [];
+    regions = state.regions || [];
+    members = state.members || [];
     reconcileOrdering();
     reconcileSelection();
-    markers = await api(`/api/projects/${id}/markers`);
-    regions = await api(`/api/projects/${id}/regions`);
-    await refreshMembers();
     await tick();
     attachAll();
   }
@@ -210,8 +213,8 @@
     if (me?.username === username) me = { ...me, color };
     presenceUsers = presenceUsers.map(u => u.username === username ? { ...u, color } : u);
     members = members.map(m => m.username === username ? { ...m, color } : m);
-    markers = markers.map(m => annotationAuthor(m) === username ? { ...m, author_color: color, authorColor: color, color } : m);
-    regions = regions.map(r => annotationAuthor(r) === username ? { ...r, author_color: color, authorColor: color, color } : r);
+    // markers/regions: authorColor comes from a live JOIN on next /state fetch;
+    // patch the open editor so it shows the new color immediately without a refresh.
     if (annotationEditor?.author === username) annotationEditor = { ...annotationEditor, color };
   }
 
@@ -238,8 +241,6 @@
         const username = msg.payload?.username || msg.user;
         const color = msg.payload?.color || msg.color;
         applyUserColor(username, color);
-      } else if (msg.type === 'clip.ingest.progress') {
-        applyJobProgress(msg.payload || {});
       } else if (msg.type?.startsWith('project.member.')) {
         try {
           await refreshMembers();
@@ -251,7 +252,10 @@
           setError('Your access to this project changed.');
           await loadProjects();
         }
+      } else if (msg.type === 'clip.ingest.progress') {
+        applyJobProgress(msg.payload || {});
       } else if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) {
+        // Refresh state once per WS event instead of separate project+manifest+markers+regions fetches.
         await refreshProject();
         if (msg.type?.startsWith('clip.') || msg.type?.startsWith('ingest.')) await refreshIngestJobs();
       }
@@ -653,7 +657,7 @@
     if (!targetIds.length) return false;
 
     try {
-      const result = await postJSON(`/api/projects/${current.id}/clips/delete`, {
+      const result = await deleteJSON(`/api/projects/${current.id}/clips`, {
         clipIds: targetIds.map(id => Number(id)).filter(Number.isFinite)
       });
       const removed = uniqueClipIds([...(result?.deletedClipIds || []), ...(result?.missingClipIds || [])]);
@@ -1207,7 +1211,8 @@
     return fallback;
   }
   function annotationColor(item, fallback) {
-    const stored = item?.author_color || item?.authorColor || item?.color || fallback;
+    // authorColor is the single canonical field from the server JOIN on users.color.
+    const stored = item?.authorColor || fallback;
     return colorForUsername(annotationAuthor(item), stored);
   }
   function markerColor(m) { return annotationColor(m, '#f6c85f'); }
@@ -1220,7 +1225,7 @@
     return members.find(m => m.username === me.username)?.role || '';
   }
   function canAnnotateProject() { return ['owner','editor','member'].includes(myProjectRole()); }
-  function annotationAuthor(item) { return item?.author_username || item?.authorUsername || item?.author || 'unknown'; }
+  function annotationAuthor(item) { return item?.author_username || 'unknown'; }
   function canEditAnnotation(item) { return !!(item && me && (annotationAuthor(item) === me.username || isProjectOwner())); }
   function annotationEditorCanEdit() { return !!(annotationEditor && me && (annotationEditor.author === me.username || isProjectOwner())); }
   function readOnlyAnnotationMessage() { return 'Read-only: only the author or project owner can edit.'; }

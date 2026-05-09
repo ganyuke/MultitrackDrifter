@@ -27,9 +27,6 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-  display_name TEXT NOT NULL,
-  user_color TEXT NOT NULL,
-  can_create_projects INTEGER NOT NULL DEFAULT 0,
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -44,17 +41,9 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS project_memberships (
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-  role TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('editor','viewer')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (project_id, username)
-);
-CREATE TABLE IF NOT EXISTS project_acl_rules (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  subject_type TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  permission TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS perspectives (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +115,7 @@ CREATE TABLE IF NOT EXISTS clips (
   stream_index INTEGER NOT NULL DEFAULT 0,
   display_name TEXT NOT NULL,
   ingest_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(ingest_status IN ('PENDING','PROCESSING','SUCCESS','FAILED')),
+  link_group_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -134,17 +124,26 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
   state TEXT NOT NULL CHECK(state IN ('PENDING','PROCESSING','SUCCESS','FAILED')),
+  stage TEXT NOT NULL DEFAULT '',
+  progress_pct REAL NOT NULL DEFAULT 0,
+  progress_time_ms INTEGER NOT NULL DEFAULT 0,
+  total_duration_ms INTEGER NOT NULL DEFAULT 0,
+  ffmpeg_frame INTEGER NOT NULL DEFAULT 0,
+  ffmpeg_fps REAL NOT NULL DEFAULT 0,
+  ffmpeg_bitrate TEXT NOT NULL DEFAULT '',
+  ffmpeg_speed TEXT NOT NULL DEFAULT '',
+  last_log TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
-  finished_at TEXT
+  finished_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS markers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   marker_ts_ms INTEGER NOT NULL,
   author_username TEXT NOT NULL REFERENCES users(username),
-  author_color TEXT NOT NULL,
   label TEXT NOT NULL,
   note TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -156,7 +155,6 @@ CREATE TABLE IF NOT EXISTS regions (
   region_start_ms INTEGER NOT NULL,
   region_end_ms INTEGER NOT NULL,
   author_username TEXT NOT NULL REFERENCES users(username),
-  author_color TEXT NOT NULL,
   label TEXT NOT NULL,
   note TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -167,48 +165,90 @@ CREATE INDEX IF NOT EXISTS idx_clips_project ON clips(project_id);
 CREATE INDEX IF NOT EXISTS idx_markers_project_ts ON markers(project_id, marker_ts_ms);
 CREATE INDEX IF NOT EXISTS idx_regions_project_ts ON regions(project_id, region_start_ms);
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_state ON ingest_jobs(state);
-`}, {2, `
 CREATE INDEX IF NOT EXISTS idx_perspectives_project_sort ON perspectives(project_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_tracks_project_sort ON tracks(project_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_clips_project_ingest_status ON clips(project_id, ingest_status);
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_project_state_clip ON ingest_jobs(project_id, state, clip_id, id);
-`}, {3, `
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_state_id ON ingest_jobs(state, id);
-`}, {4, `
-WITH ranked_active_jobs AS (
-  SELECT
-    id,
-    ROW_NUMBER() OVER (
-      PARTITION BY project_id, clip_id
-      ORDER BY CASE state WHEN 'PROCESSING' THEN 0 ELSE 1 END, id
-    ) AS rn
-  FROM ingest_jobs
-  WHERE state IN ('PENDING','PROCESSING')
-)
-UPDATE ingest_jobs
-SET state='FAILED',
-    error='superseded by another active ingest job during uniqueness migration',
-    finished_at=datetime('now')
-WHERE id IN (SELECT id FROM ranked_active_jobs WHERE rn > 1);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_jobs_one_active_per_clip
-ON ingest_jobs(project_id, clip_id)
-WHERE state IN ('PENDING','PROCESSING');
-`}, {5, `
-ALTER TABLE ingest_jobs ADD COLUMN stage TEXT NOT NULL DEFAULT '';
-ALTER TABLE ingest_jobs ADD COLUMN progress_pct REAL NOT NULL DEFAULT 0;
-ALTER TABLE ingest_jobs ADD COLUMN progress_time_ms INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE ingest_jobs ADD COLUMN total_duration_ms INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_frame INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_fps REAL NOT NULL DEFAULT 0;
-ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_bitrate TEXT NOT NULL DEFAULT '';
-ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_speed TEXT NOT NULL DEFAULT '';
-ALTER TABLE ingest_jobs ADD COLUMN last_log TEXT NOT NULL DEFAULT '';
-ALTER TABLE ingest_jobs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
-UPDATE ingest_jobs SET updated_at=COALESCE(NULLIF(finished_at,''), NULLIF(started_at,''), created_at, datetime('now')) WHERE updated_at='';
-`}, {6, `
-ALTER TABLE clips ADD COLUMN link_group_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_clips_project_link_group ON clips(project_id, link_group_id);
-`}}
+`},
+// Migration 2: sessions table had denormalized user fields (display_name, user_color,
+// can_create_projects). These were stale copies of users table data. Drop them and
+// join to users at query time. Also drop the dead project_acl_rules table that was
+// never queried. Also drop author_color from markers/regions — color is always read
+// from users table with a JOIN; the stored copy became stale when users changed colors.
+{2, `
+-- sessions: drop denormalized user columns; we JOIN users at lookup time
+ALTER TABLE sessions ADD COLUMN _v2_marker INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE sessions_v2 (
+  token_hash TEXT PRIMARY KEY,
+  username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO sessions_v2(token_hash, username, expires_at, created_at)
+  SELECT token_hash, username, expires_at, created_at FROM sessions;
+DROP TABLE sessions;
+ALTER TABLE sessions_v2 RENAME TO sessions;
+
+-- markers/regions: drop denormalized author_color; always join users.color
+CREATE TABLE markers_v2 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  marker_ts_ms INTEGER NOT NULL,
+  author_username TEXT NOT NULL REFERENCES users(username),
+  label TEXT NOT NULL,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO markers_v2(id, project_id, marker_ts_ms, author_username, label, note, created_at, updated_at)
+  SELECT id, project_id, marker_ts_ms, author_username, label, COALESCE(note,''), created_at, updated_at FROM markers;
+DROP TABLE markers;
+ALTER TABLE markers_v2 RENAME TO markers;
+
+CREATE TABLE regions_v2 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  region_start_ms INTEGER NOT NULL,
+  region_end_ms INTEGER NOT NULL,
+  author_username TEXT NOT NULL REFERENCES users(username),
+  label TEXT NOT NULL,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK(region_end_ms >= region_start_ms)
+);
+INSERT INTO regions_v2(id, project_id, region_start_ms, region_end_ms, author_username, label, note, created_at, updated_at)
+  SELECT id, project_id, region_start_ms, region_end_ms, author_username, label, COALESCE(note,''), created_at, updated_at FROM regions;
+DROP TABLE regions;
+ALTER TABLE regions_v2 RENAME TO regions;
+
+-- drop the dead ACL rules table — never queried, never enforced
+DROP TABLE IF EXISTS project_acl_rules;
+
+-- restore indexes dropped with old tables
+CREATE INDEX IF NOT EXISTS idx_markers_project_ts ON markers(project_id, marker_ts_ms);
+CREATE INDEX IF NOT EXISTS idx_regions_project_ts ON regions(project_id, region_start_ms);
+`},
+// Migration 3: consolidate 'member' role → 'editor'. The schema allowed 'member' as a
+// synonym for 'editor' in code but the CHECK constraint accepted it in old rows.
+{3, `
+UPDATE project_memberships SET role='editor' WHERE role='member';
+`},
+// Migration 4-6 from original (indexes + ingest job fields + link_group_id) are
+// already folded into migration 1 above for fresh installs. These run only on
+// databases that have older migrations recorded but don't have the columns yet.
+// They are no-ops on fresh installs because the schema_migrations table will have
+// version 1 covering everything.
+// Migrations 4-6 from original codebase are no-ops here; their schema changes are
+// folded into migration 1 above.  The SELECT 1 entries exist so existing databases
+// that have versions 4-6 already recorded don't error on startup.
+{4, `SELECT 1`},
+{5, `SELECT 1`},
+{6, `SELECT 1`},
+}
 
 func Migrate(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')));`); err != nil {

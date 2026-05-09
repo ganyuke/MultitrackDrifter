@@ -28,25 +28,21 @@ func (s *Server) listProjectMembers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(), `
 SELECT username, display_name, color, role, created_at
 FROM (
-  SELECT u.username, u.display_name, u.color, 'owner' AS role, p.created_at AS created_at, 0 AS sort_order
-  FROM projects p
-  JOIN users u ON u.username = p.owner_username
-  WHERE p.id = ?
+  SELECT u.username, u.display_name, u.color, 'owner' AS role, p.created_at, 0 AS ord
+  FROM projects p JOIN users u ON u.username=p.owner_username WHERE p.id=?
   UNION ALL
   SELECT u.username, u.display_name, u.color, pm.role, pm.created_at,
-    CASE pm.role WHEN 'editor' THEN 1 WHEN 'member' THEN 1 WHEN 'viewer' THEN 2 ELSE 3 END AS sort_order
+    CASE pm.role WHEN 'editor' THEN 1 ELSE 2 END
   FROM project_memberships pm
-  JOIN projects p ON p.id = pm.project_id
-  JOIN users u ON u.username = pm.username
-  WHERE pm.project_id = ? AND pm.username <> p.owner_username
-)
-ORDER BY sort_order, username`, projectID, projectID)
+  JOIN projects p ON p.id=pm.project_id
+  JOIN users u ON u.username=pm.username
+  WHERE pm.project_id=? AND pm.username<>p.owner_username
+) ORDER BY ord, username`, projectID, projectID)
 	if err != nil {
 		writeError(w, 500, err)
 		return
 	}
 	defer rows.Close()
-
 	members := []projectMember{}
 	for rows.Next() {
 		var m projectMember
@@ -98,8 +94,7 @@ func (s *Server) addProjectMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err := s.db.ExecContext(r.Context(), `
-INSERT INTO project_memberships(project_id, username, role)
-VALUES (?, ?, ?)
+INSERT INTO project_memberships(project_id, username, role) VALUES (?, ?, ?)
 ON CONFLICT(project_id, username) DO UPDATE SET role=excluded.role`, projectID, username, role)
 	if err != nil {
 		writeError(w, 500, err)
@@ -181,9 +176,10 @@ func (s *Server) deleteProjectMember(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// normalizeMemberRole collapses 'member' (legacy synonym) → 'editor'.
 func normalizeMemberRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
-	case "", "editor", "member":
+	case "editor", "member":
 		return "editor"
 	case "viewer":
 		return "viewer"
@@ -209,11 +205,9 @@ func (s *Server) requireProjectMember(w http.ResponseWriter, r *http.Request, pr
 	var allowed int
 	err := s.db.QueryRowContext(r.Context(), `
 SELECT CASE WHEN EXISTS (
-  SELECT 1
-  FROM projects p
+  SELECT 1 FROM projects p
   LEFT JOIN project_memberships pm ON pm.project_id=p.id AND pm.username=?
-  WHERE p.id=?
-    AND (p.owner_username=? OR pm.role IN ('owner','editor','member','viewer'))
+  WHERE p.id=? AND (p.owner_username=? OR pm.role IN ('editor','viewer'))
 ) THEN 1 ELSE 0 END`, p.Username, projectID, p.Username).Scan(&allowed)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, errors.New("project not found"))

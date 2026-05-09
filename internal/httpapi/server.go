@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -80,10 +79,13 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PATCH /api/projects/{projectID}/perspectives/{perspectiveID}", s.auth.Middleware(http.HandlerFunc(s.patchPerspective)))
 	mux.Handle("POST /api/projects/{projectID}/tracks", s.auth.Middleware(http.HandlerFunc(s.createTrack)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.patchClips)))
-	mux.Handle("POST /api/projects/{projectID}/clips/delete", s.auth.Middleware(http.HandlerFunc(s.deleteClips)))
+	// Bulk delete via DELETE with JSON body — replaces old POST /clips/delete workaround.
+	mux.Handle("DELETE /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.deleteClips)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.patchClip)))
 	mux.Handle("DELETE /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.deleteClip)))
-	mux.Handle("GET /api/projects/{projectID}/playback-manifest", s.auth.Middleware(http.HandlerFunc(s.playbackManifest)))
+	// Combined state endpoint: replaces 4-5 sequential fetches (project + manifest +
+	// markers + regions + members) with a single round-trip.
+	mux.Handle("GET /api/projects/{projectID}/state", s.auth.Middleware(http.HandlerFunc(s.getProjectState)))
 	mux.Handle("GET /api/projects/{projectID}/markers", s.auth.Middleware(http.HandlerFunc(s.listMarkers)))
 	mux.Handle("POST /api/projects/{projectID}/markers", s.auth.Middleware(http.HandlerFunc(s.createMarker)))
 	mux.Handle("PATCH /api/projects/{projectID}/markers/{markerID}", s.auth.Middleware(http.HandlerFunc(s.patchMarker)))
@@ -129,7 +131,6 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.FromContext(r.Context())
-	// Keep long review sessions alive, but avoid rewriting the session row on every /api/me poll.
 	if c, err := r.Cookie(auth.CookieName); err == nil {
 		if refreshed, err := s.auth.RefreshIfNeeded(r.Context(), c.Value, p); err == nil {
 			p = refreshed
@@ -169,7 +170,7 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 SELECT DISTINCT p.id, p.name, p.description, p.owner_username, p.created_at, p.updated_at
 FROM projects p
 LEFT JOIN project_memberships pm ON pm.project_id=p.id AND pm.username=?
-WHERE p.owner_username=? OR pm.role IN ('owner','editor','member','viewer')
+WHERE p.owner_username=? OR pm.role IN ('editor','viewer')
 ORDER BY p.updated_at DESC`, p.Username, p.Username)
 	if err != nil {
 		writeError(w, 500, err)
@@ -216,7 +217,6 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := res.LastInsertId()
-	_, _ = tx.ExecContext(r.Context(), `INSERT INTO project_memberships(project_id, username, role) VALUES (?, ?, 'owner')`, id, p.Username)
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
@@ -232,15 +232,13 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
-	var project map[string]any
-	row := s.db.QueryRowContext(r.Context(), `SELECT id, name, description, owner_username FROM projects WHERE id=?`, projectID)
 	var id int64
 	var name, desc, owner string
-	if err := row.Scan(&id, &name, &desc, &owner); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `SELECT id, name, description, owner_username FROM projects WHERE id=?`, projectID).Scan(&id, &name, &desc, &owner); err != nil {
 		writeError(w, 404, err)
 		return
 	}
-	project = map[string]any{"id": id, "name": name, "description": desc, "ownerUsername": owner}
+	project := map[string]any{"id": id, "name": name, "description": desc, "ownerUsername": owner}
 	project["perspectives"] = s.queryRows(r.Context(), `SELECT id, name, sort_order FROM perspectives WHERE project_id=? ORDER BY sort_order,id`, projectID)
 	project["tracks"] = s.queryRows(r.Context(), `SELECT id, perspective_id, kind, name, sort_order FROM tracks WHERE project_id=? ORDER BY sort_order,id`, projectID)
 	project["clips"] = s.queryRows(r.Context(), `SELECT id, perspective_id, track_id, source_asset_id, source_revision_id, COALESCE(hls_asset_id,0), media_kind, wallclock_start_ms, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0), stream_index, display_name, ingest_status FROM clips WHERE project_id=? ORDER BY wallclock_start_ms,id`, projectID)
@@ -266,6 +264,117 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// getProjectState combines what was previously 4-5 sequential client fetches
+// (GET /projects/:id, GET /playback-manifest, GET /markers, GET /regions, GET /members)
+// into a single response.  Author colors are always read live from users table —
+// no stale cached copies.
+func (s *Server) getProjectState(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := pathID(w, r, "projectID")
+	if !ok {
+		return
+	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
+
+	var name, desc, owner string
+	if err := s.db.QueryRowContext(r.Context(), `SELECT name, description, owner_username FROM projects WHERE id=?`, projectID).Scan(&name, &desc, &owner); err != nil {
+		writeError(w, 404, err)
+		return
+	}
+
+	perspectives := s.queryRows(r.Context(), `SELECT id, name, sort_order FROM perspectives WHERE project_id=? ORDER BY sort_order,id`, projectID)
+	tracks := s.queryRows(r.Context(), `SELECT id, perspective_id, kind, name, sort_order FROM tracks WHERE project_id=? ORDER BY sort_order,id`, projectID)
+
+	clipRows, err := s.db.QueryContext(r.Context(), `
+SELECT c.id, c.perspective_id, p.name, c.track_id, t.name, c.media_kind,
+       c.wallclock_start_ms, c.duration_ms,
+       COALESCE(c.fps_num,0), COALESCE(c.fps_den,0),
+       c.stream_index, c.display_name, c.ingest_status,
+       COALESCE(h.playlist_path,''), COALESCE(c.link_group_id,'')
+FROM clips c
+JOIN tracks t ON t.id=c.track_id
+JOIN perspectives p ON p.id=c.perspective_id
+LEFT JOIN hls_assets h ON h.id=c.hls_asset_id
+WHERE c.project_id=?
+ORDER BY c.wallclock_start_ms, c.id`, projectID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	defer clipRows.Close()
+
+	var clips []map[string]any
+	for clipRows.Next() {
+		var clipID, pid, tid, start, dur, fpsN, fpsD int64
+		var streamIndex int
+		var pname, tname, kind, displayName, status, playlist, linkGroupID string
+		if err := clipRows.Scan(&clipID, &pid, &pname, &tid, &tname, &kind, &start, &dur, &fpsN, &fpsD, &streamIndex, &displayName, &status, &playlist, &linkGroupID); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		hlsURL := ""
+		if playlist != "" && status == "SUCCESS" {
+			hlsURL, err = s.cachedHLSURL(r.Context(), storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: playlist}, s.cfg.HLSPresignTTL)
+			if err != nil {
+				writeError(w, 500, err)
+				return
+			}
+		}
+		clips = append(clips, map[string]any{
+			"clipId": clipID, "perspectiveId": pid, "perspectiveName": pname,
+			"trackId": tid, "trackName": tname, "kind": kind,
+			"wallclockStartMs": start, "durationMs": dur,
+			"fpsNum": fpsN, "fpsDen": fpsD, "streamIndex": streamIndex,
+			"displayName": displayName, "ingestStatus": status,
+			"hlsURL": hlsURL, "linkGroupId": linkGroupID,
+		})
+	}
+	if err := clipRows.Err(); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+
+	// Author color always comes from users table — no stale cached copy.
+	markers := s.queryRows(r.Context(), `
+SELECT m.id, m.marker_ts_ms, m.author_username, u.color AS authorColor,
+       m.label, COALESCE(m.note,'') AS note, m.created_at, m.updated_at
+FROM markers m
+JOIN users u ON u.username=m.author_username
+WHERE m.project_id=? ORDER BY m.marker_ts_ms`, projectID)
+
+	regions := s.queryRows(r.Context(), `
+SELECT r.id, r.region_start_ms, r.region_end_ms, r.author_username, u.color AS authorColor,
+       r.label, COALESCE(r.note,'') AS note, r.created_at, r.updated_at
+FROM regions r
+JOIN users u ON u.username=r.author_username
+WHERE r.project_id=? ORDER BY r.region_start_ms`, projectID)
+
+	members := s.queryRows(r.Context(), `
+SELECT username, display_name, color, role, created_at
+FROM (
+  SELECT u.username, u.display_name, u.color, 'owner' AS role, p.created_at, 0 AS ord
+  FROM projects p JOIN users u ON u.username=p.owner_username WHERE p.id=?
+  UNION ALL
+  SELECT u.username, u.display_name, u.color, pm.role, pm.created_at,
+    CASE pm.role WHEN 'editor' THEN 1 ELSE 2 END
+  FROM project_memberships pm
+  JOIN projects p ON p.id=pm.project_id
+  JOIN users u ON u.username=pm.username
+  WHERE pm.project_id=? AND pm.username<>p.owner_username
+) ORDER BY ord, username`, projectID, projectID)
+
+	writeJSON(w, 200, map[string]any{
+		"id": projectID, "name": name, "description": desc, "ownerUsername": owner,
+		"perspectives": perspectives,
+		"tracks":       tracks,
+		"clips":        clips,
+		"markers":      markers,
+		"regions":      regions,
+		"members":      members,
+	})
 }
 
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +487,11 @@ func (s *Server) createAssetClip(w http.ResponseWriter, r *http.Request) {
 		if displayName == "" {
 			displayName = req.DisplayName + " - " + defaultStreamTrackName(st)
 		}
-		clipReqs = append(clipReqs, createClipReq{SourcePath: req.SourcePath, Perspective: req.Perspective, Track: track, Kind: st.Kind, WallclockStartMS: req.WallclockStartMS, DisplayName: displayName, StreamIndex: st.StreamIndex, DurationMS: st.DurationMS, FPSNum: st.FPSNum, FPSDen: st.FPSDen})
+		clipReqs = append(clipReqs, createClipReq{
+			SourcePath: req.SourcePath, Perspective: req.Perspective, Track: track,
+			Kind: st.Kind, WallclockStartMS: req.WallclockStartMS, DisplayName: displayName,
+			StreamIndex: st.StreamIndex, DurationMS: st.DurationMS, FPSNum: st.FPSNum, FPSDen: st.FPSDen,
+		})
 	}
 	clipIDs, pendingClipIDs, reusedClipIDs, err := s.createSourceRevisionClips(r.Context(), projectID, clipReqs, info)
 	if err != nil {
@@ -408,9 +521,7 @@ type createClipReq struct {
 	SourcePath, Perspective, Track, Kind, DisplayName string
 	WallclockStartMS                                  int64
 	StreamIndex                                       int
-	DurationMS                                        int64
-	FPSNum                                            int64
-	FPSDen                                            int64
+	DurationMS, FPSNum, FPSDen                        int64
 }
 
 func (s *Server) selectedStreamSpecs(ctx context.Context, sourcePath string, requested []createStreamSpec, streamIndex *int, kind, track, displayName string) ([]createStreamSpec, error) {
@@ -431,9 +542,7 @@ func (s *Server) selectedStreamSpecs(ctx context.Context, sourcePath string, req
 			if strings.TrimSpace(st.Label) == "" {
 				st.Label = summary.Label
 			}
-			st.DurationMS = summary.DurationMS
-			st.FPSNum = summary.FPSNum
-			st.FPSDen = summary.FPSDen
+			st.DurationMS, st.FPSNum, st.FPSDen = summary.DurationMS, summary.FPSNum, summary.FPSDen
 		}
 		if st.Kind == "" {
 			st.Kind = strings.ToLower(strings.TrimSpace(kind))
@@ -487,8 +596,7 @@ func (s *Server) selectedStreamSpecs(ctx context.Context, sourcePath string, req
 }
 
 func defaultStreamTrackName(st createStreamSpec) string {
-	label := strings.TrimSpace(st.Label)
-	if label != "" {
+	if label := strings.TrimSpace(st.Label); label != "" {
 		return label
 	}
 	if st.Kind == "audio" {
@@ -497,13 +605,13 @@ func defaultStreamTrackName(st createStreamSpec) string {
 	return fmt.Sprintf("Video %d", st.StreamIndex)
 }
 
-func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64, reqs []createClipReq, info storage.ObjectInfo) (clipIDs []int64, pendingClipIDs []int64, reusedClipIDs []int64, err error) {
+func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64, reqs []createClipReq, info storage.ObjectInfo) (clipIDs, pendingClipIDs, reusedClipIDs []int64, err error) {
 	if len(reqs) == 0 {
 		return nil, nil, nil, errors.New("at least one stream required")
 	}
 	linkGroupID := ""
 	if len(reqs) > 1 {
-		linkGroupID = newClipLinkGroupID()
+		linkGroupID = newLinkGroupID()
 	}
 	fp := ingest.FingerprintJSON(info)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -517,10 +625,10 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 	}()
 
 	var assetID, revID int64
-	displayName := reqs[0].DisplayName
 	if err = tx.QueryRowContext(ctx, `SELECT id FROM source_assets WHERE current_path=?`, info.Ref.Path).Scan(&assetID); err == sql.ErrNoRows {
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO source_assets(adapter, bucket, current_key, current_path, display_name) VALUES (?, ?, ?, ?, ?)`, info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, displayName)
+		res, err = tx.ExecContext(ctx, `INSERT INTO source_assets(adapter, bucket, current_key, current_path, display_name) VALUES (?, ?, ?, ?, ?)`,
+			info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, reqs[0].DisplayName)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -533,7 +641,8 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 
 	if err = tx.QueryRowContext(ctx, `SELECT id FROM source_asset_revisions WHERE source_asset_id=? AND fingerprint_json=?`, assetID, fp).Scan(&revID); err == sql.ErrNoRows {
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO source_asset_revisions(source_asset_id, adapter, bucket, key, path, size_bytes, fingerprint_json) VALUES (?, ?, ?, ?, ?, ?, ?)`, assetID, info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, info.SizeBytes, fp)
+		res, err = tx.ExecContext(ctx, `INSERT INTO source_asset_revisions(source_asset_id, adapter, bucket, key, path, size_bytes, fingerprint_json) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			assetID, info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, info.SizeBytes, fp)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -542,56 +651,53 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 		return nil, nil, nil, err
 	}
 
-	perspectiveIDs := map[string]int64{}
+	perspIDs := map[string]int64{}
 	trackIDs := map[string]int64{}
 	for _, req := range reqs {
 		if req.Kind != "video" && req.Kind != "audio" {
 			return nil, nil, nil, fmt.Errorf("invalid media kind %q", req.Kind)
 		}
-		perspectiveID, e := perspectiveIDFor(ctx, tx, projectID, req.Perspective, perspectiveIDs)
+		perspID, e := perspectiveIDFor(ctx, tx, projectID, req.Perspective, perspIDs)
 		if e != nil {
-			err = e
-			return nil, nil, nil, err
+			return nil, nil, nil, e
 		}
-		trackID, e := trackIDFor(ctx, tx, projectID, perspectiveID, req.Kind, req.Track, trackIDs)
+		trackID, e := trackIDFor(ctx, tx, projectID, perspID, req.Kind, req.Track, trackIDs)
 		if e != nil {
-			err = e
-			return nil, nil, nil, err
+			return nil, nil, nil, e
 		}
-
-		// Timeline imports always create a fresh clip row. Source assets, source
-		// revisions, and HLS assets stay de-duplicated below, but users may reuse the
-		// same source stream multiple times in the same perspective/track.
 
 		var hlsID sql.NullInt64
-		durationMS := req.DurationMS
-		fpsNum, fpsDen := req.FPSNum, req.FPSDen
+		durationMS, fpsNum, fpsDen := req.DurationMS, req.FPSNum, req.FPSDen
 		status := "PENDING"
 		streamID := fmt.Sprintf("stream-%d", req.StreamIndex)
-		var hlsDurationMS, hlsFPSNum, hlsFPSDen int64
+		var hlsDur, hlsFPSNum, hlsFPSDen int64
 		err = tx.QueryRowContext(ctx, `
 SELECT id, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0)
-FROM hls_assets
-WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`, revID, streamID, s.cfg.TranscodeProfile).Scan(&hlsID, &hlsDurationMS, &hlsFPSNum, &hlsFPSDen)
+FROM hls_assets WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`,
+			revID, streamID, s.cfg.TranscodeProfile).Scan(&hlsID, &hlsDur, &hlsFPSNum, &hlsFPSDen)
 		if err == nil {
 			status = "SUCCESS"
-			durationMS, fpsNum, fpsDen = hlsDurationMS, hlsFPSNum, hlsFPSDen
+			durationMS, fpsNum, fpsDen = hlsDur, hlsFPSNum, hlsFPSDen
 		} else if err == sql.ErrNoRows {
 			err = nil
 		} else {
 			return nil, nil, nil, err
 		}
 
-		var hlsValue any
+		var hlsVal any
 		if hlsID.Valid {
-			hlsValue = hlsID.Int64
+			hlsVal = hlsID.Int64
 		}
 		res, e := tx.ExecContext(ctx, `
-INSERT INTO clips(project_id, perspective_id, track_id, source_asset_id, source_revision_id, hls_asset_id, media_kind, wallclock_start_ms, duration_ms, fps_num, fps_den, display_name, stream_index, ingest_status, link_group_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0), ?, ?, ?, ?)`, projectID, perspectiveID, trackID, assetID, revID, hlsValue, req.Kind, req.WallclockStartMS, durationMS, fpsNum, fpsDen, req.DisplayName, req.StreamIndex, status, linkGroupID)
+INSERT INTO clips(project_id, perspective_id, track_id, source_asset_id, source_revision_id,
+                  hls_asset_id, media_kind, wallclock_start_ms, duration_ms,
+                  fps_num, fps_den, display_name, stream_index, ingest_status, link_group_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0), ?, ?, ?, ?)`,
+			projectID, perspID, trackID, assetID, revID, hlsVal,
+			req.Kind, req.WallclockStartMS, durationMS,
+			fpsNum, fpsDen, req.DisplayName, req.StreamIndex, status, linkGroupID)
 		if e != nil {
-			err = e
-			return nil, nil, nil, err
+			return nil, nil, nil, e
 		}
 		clipID, _ := res.LastInsertId()
 		clipIDs = append(clipIDs, clipID)
@@ -627,18 +733,18 @@ func perspectiveIDFor(ctx context.Context, tx *sql.Tx, projectID int64, name str
 	return id, nil
 }
 
-func trackIDFor(ctx context.Context, tx *sql.Tx, projectID, perspectiveID int64, kind, name string, cache map[string]int64) (int64, error) {
+func trackIDFor(ctx context.Context, tx *sql.Tx, projectID, perspID int64, kind, name string, cache map[string]int64) (int64, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = titleKind(kind)
 	}
-	cacheKey := fmt.Sprintf("%d:%s:%s", perspectiveID, kind, name)
+	cacheKey := fmt.Sprintf("%d:%s:%s", perspID, kind, name)
 	if id, ok := cache[cacheKey]; ok {
 		return id, nil
 	}
 	var id int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM tracks WHERE project_id=? AND perspective_id=? AND kind=? AND name=?`, projectID, perspectiveID, kind, name).Scan(&id); err == sql.ErrNoRows {
-		res, err := tx.ExecContext(ctx, `INSERT INTO tracks(project_id, perspective_id, kind, name) VALUES (?, ?, ?, ?)`, projectID, perspectiveID, kind, name)
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM tracks WHERE project_id=? AND perspective_id=? AND kind=? AND name=?`, projectID, perspID, kind, name).Scan(&id); err == sql.ErrNoRows {
+		res, err := tx.ExecContext(ctx, `INSERT INTO tracks(project_id, perspective_id, kind, name) VALUES (?, ?, ?, ?)`, projectID, perspID, kind, name)
 		if err != nil {
 			return 0, err
 		}
@@ -650,7 +756,7 @@ func trackIDFor(ctx context.Context, tx *sql.Tx, projectID, perspectiveID int64,
 	return id, nil
 }
 
-func newClipLinkGroupID() string {
+func newLinkGroupID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return fmt.Sprintf("lg-%d", time.Now().UnixNano())
@@ -662,27 +768,24 @@ func (s *Server) enqueueClipJobs(ctx context.Context, projectID int64, clipIDs [
 	if len(clipIDs) == 0 {
 		return nil, nil
 	}
-
-	values := make([]string, 0, len(clipIDs))
+	placeholders := make([]string, len(clipIDs))
 	args := make([]any, 0, len(clipIDs)+2)
-	for _, clipID := range clipIDs {
-		values = append(values, "(?)")
-		args = append(args, clipID)
+	for i, id := range clipIDs {
+		placeholders[i] = "(?)"
+		args = append(args, id)
 	}
 	args = append(args, projectID, projectID)
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 WITH requested(clip_id) AS (VALUES %s),
 active_jobs AS (
-	SELECT clip_id, MAX(id) AS job_id
-	FROM ingest_jobs
-	WHERE project_id=? AND state IN ('PENDING','PROCESSING')
-	GROUP BY clip_id
+  SELECT clip_id, MAX(id) AS job_id FROM ingest_jobs
+  WHERE project_id=? AND state IN ('PENDING','PROCESSING') GROUP BY clip_id
 )
 SELECT r.clip_id, c.ingest_status, COALESCE(a.job_id, 0)
 FROM requested r
 JOIN clips c ON c.id=r.clip_id AND c.project_id=?
-LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), args...)
+LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -718,17 +821,13 @@ LEFT JOIN active_jobs a ON a.clip_id=r.clip_id`, strings.Join(values, ",")), arg
 			jobIDs = append(jobIDs, p.activeJobID)
 			continue
 		}
-
 		jobID, err := s.insertPendingIngestJob(ctx, projectID, clipID)
 		if err != nil {
 			return nil, err
 		}
-		if jobID == 0 {
-			continue
+		if jobID != 0 {
+			jobIDs = append(jobIDs, jobID)
 		}
-		jobIDs = append(jobIDs, jobID)
-		p.activeJobID = jobID
-		plans[clipID] = p
 	}
 	if len(jobIDs) > 0 {
 		s.ingest.Notify()
@@ -740,31 +839,22 @@ func (s *Server) insertPendingIngestJob(ctx context.Context, projectID, clipID i
 	var jobID int64
 	err := s.db.QueryRowContext(ctx, `
 INSERT OR IGNORE INTO ingest_jobs(project_id, clip_id, state)
-VALUES (?, ?, 'PENDING')
-RETURNING id`, projectID, clipID).Scan(&jobID)
+VALUES (?, ?, 'PENDING') RETURNING id`, projectID, clipID).Scan(&jobID)
 	if err == nil {
 		return jobID, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-
-	// A concurrent request may have inserted the active job after our batched
-	// preflight query. The partial unique index makes that race harmless; return
-	// the existing/latest job ID so the caller can report stable status.
+	// Race: another goroutine inserted first. Return the existing active job.
 	err = s.db.QueryRowContext(ctx, `
-SELECT id
-FROM ingest_jobs
-WHERE project_id=? AND clip_id=?
+SELECT id FROM ingest_jobs WHERE project_id=? AND clip_id=?
 ORDER BY CASE WHEN state IN ('PENDING','PROCESSING') THEN 0 ELSE 1 END, id DESC
 LIMIT 1`, projectID, clipID).Scan(&jobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	return jobID, nil
+	return jobID, err
 }
 
 func (s *Server) triggerIngest(w http.ResponseWriter, r *http.Request) {
@@ -792,7 +882,7 @@ func (s *Server) listIngestJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows := s.queryRows(r.Context(), `
-SELECT j.id, j.clip_id, COALESCE(c.display_name, '') AS clip_name, j.state, j.stage, j.error,
+SELECT j.id, j.clip_id, COALESCE(c.display_name,'') AS clip_name, j.state, j.stage, j.error,
        j.progress_pct, j.progress_time_ms, j.total_duration_ms,
        j.ffmpeg_frame, j.ffmpeg_fps, j.ffmpeg_bitrate, j.ffmpeg_speed,
        j.created_at, j.started_at, j.finished_at, j.updated_at
@@ -947,38 +1037,29 @@ func (s *Server) patchClips(w http.ResponseWriter, r *http.Request) {
 	updates := make([]map[string]any, 0, len(req.Updates))
 	missing := []int64{}
 	seen := map[int64]bool{}
-	for _, update := range req.Updates {
-		if update.ClipID <= 0 {
+	for _, u := range req.Updates {
+		if u.ClipID <= 0 {
 			writeError(w, 400, errors.New("clipId must be positive"))
 			return
 		}
-		if seen[update.ClipID] {
+		if seen[u.ClipID] {
 			continue
 		}
-		seen[update.ClipID] = true
-		start := update.WallclockStartMS
+		seen[u.ClipID] = true
+		start := u.WallclockStartMS
 		if start < 0 {
 			start = 0
 		}
-		res, err := tx.ExecContext(r.Context(), `UPDATE clips SET wallclock_start_ms=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, start, update.ClipID, projectID)
+		res, err := tx.ExecContext(r.Context(), `UPDATE clips SET wallclock_start_ms=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, start, u.ClipID, projectID)
 		if err != nil {
 			writeError(w, 500, err)
 			return
 		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			writeError(w, 500, err)
-			return
-		}
-		if rows == 0 {
-			missing = append(missing, update.ClipID)
+		if n, _ := res.RowsAffected(); n == 0 {
+			missing = append(missing, u.ClipID)
 			continue
 		}
-		updates = append(updates, map[string]any{"clipId": update.ClipID, "wallclockStartMs": start})
-	}
-	if len(updates) == 0 && len(missing) == 0 {
-		writeError(w, 400, errors.New("no valid clip updates were provided"))
-		return
+		updates = append(updates, map[string]any{"clipId": u.ClipID, "wallclockStartMs": start})
 	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
@@ -990,6 +1071,9 @@ func (s *Server) patchClips(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"updates": updates, "missingClipIds": missing})
 }
 
+// patchClip accepts wallclockStartMs, displayName, and linkGroupId independently.
+// Previously, displayName was only applied when wallclockStartMs was also present —
+// a bug masked by the original conditional structure.
 func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -1004,40 +1088,44 @@ func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		WallclockStartMS *int64  `json:"wallclockStartMs"`
-		DisplayName      string  `json:"displayName"`
-		StreamIndex      *int    `json:"streamIndex"`
+		DisplayName      *string `json:"displayName"`
 		LinkGroupID      *string `json:"linkGroupId"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, 400, err)
 		return
 	}
+	if req.WallclockStartMS == nil && req.DisplayName == nil && req.LinkGroupID == nil {
+		writeError(w, 400, errors.New("nothing to update"))
+		return
+	}
 	if req.WallclockStartMS != nil {
-		_, err := s.db.ExecContext(r.Context(), `UPDATE clips SET wallclock_start_ms=?, display_name=COALESCE(NULLIF(?,''),display_name), updated_at=datetime('now') WHERE id=? AND project_id=?`, *req.WallclockStartMS, req.DisplayName, clipID, projectID)
-		if err != nil {
+		if _, err := s.db.ExecContext(r.Context(), `UPDATE clips SET wallclock_start_ms=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, *req.WallclockStartMS, clipID, projectID); err != nil {
 			writeError(w, 500, err)
 			return
 		}
 		s.broadcast(r, projectID, "clip.timeline.updated", map[string]any{"clipId": clipID, "wallclockStartMs": *req.WallclockStartMS})
-	} else if req.DisplayName != "" {
-		_, err := s.db.ExecContext(r.Context(), `UPDATE clips SET display_name=COALESCE(NULLIF(?,''),display_name), updated_at=datetime('now') WHERE id=? AND project_id=?`, req.DisplayName, clipID, projectID)
-		if err != nil {
-			writeError(w, 500, err)
-			return
+	}
+	if req.DisplayName != nil {
+		if name := strings.TrimSpace(*req.DisplayName); name != "" {
+			if _, err := s.db.ExecContext(r.Context(), `UPDATE clips SET display_name=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, name, clipID, projectID); err != nil {
+				writeError(w, 500, err)
+				return
+			}
 		}
 	}
 	if req.LinkGroupID != nil {
-		linkGroupID := strings.TrimSpace(*req.LinkGroupID)
-		_, err := s.db.ExecContext(r.Context(), `UPDATE clips SET link_group_id=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, linkGroupID, clipID, projectID)
-		if err != nil {
+		lg := strings.TrimSpace(*req.LinkGroupID)
+		if _, err := s.db.ExecContext(r.Context(), `UPDATE clips SET link_group_id=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, lg, clipID, projectID); err != nil {
 			writeError(w, 500, err)
 			return
 		}
-		s.broadcast(r, projectID, "clip.link.updated", map[string]any{"clipId": clipID, "linkGroupId": linkGroupID})
+		s.broadcast(r, projectID, "clip.link.updated", map[string]any{"clipId": clipID, "linkGroupId": lg})
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// deleteClips: DELETE /api/projects/{projectID}/clips with {"clipIds":[...]} body.
 func (s *Server) deleteClips(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -1065,11 +1153,10 @@ func (s *Server) deleteClips(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, errors.New("clipId must be positive"))
 			return
 		}
-		if seen[id] {
-			continue
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
 		}
-		seen[id] = true
-		ids = append(ids, id)
 	}
 
 	tx, err := s.db.BeginTx(r.Context(), nil)
@@ -1079,24 +1166,18 @@ func (s *Server) deleteClips(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	deleted := []int64{}
-	missing := []int64{}
+	deleted, missing := []int64{}, []int64{}
 	for _, id := range ids {
 		res, err := tx.ExecContext(r.Context(), `DELETE FROM clips WHERE id=? AND project_id=?`, id, projectID)
 		if err != nil {
 			writeError(w, 500, err)
 			return
 		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			writeError(w, 500, err)
-			return
-		}
-		if rows == 0 {
+		if n, _ := res.RowsAffected(); n == 0 {
 			missing = append(missing, id)
-			continue
+		} else {
+			deleted = append(deleted, id)
 		}
-		deleted = append(deleted, id)
 	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
@@ -1133,108 +1214,37 @@ func (s *Server) deleteClip(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-func (s *Server) playbackManifest(w http.ResponseWriter, r *http.Request) {
-	projectID, ok := pathID(w, r, "projectID")
-	if !ok {
-		return
-	}
-	if !s.requireProjectMember(w, r, projectID) {
-		return
-	}
-	rows, err := s.db.QueryContext(r.Context(), `
-SELECT c.id, c.perspective_id, p.name, c.track_id, t.name, c.media_kind, c.wallclock_start_ms, c.duration_ms,
-       COALESCE(c.fps_num,0), COALESCE(c.fps_den,0), c.stream_index, c.display_name, c.ingest_status,
-       COALESCE(h.playlist_path, ''), COALESCE(c.link_group_id, '')
-FROM clips c
-JOIN tracks t ON t.id=c.track_id
-JOIN perspectives p ON p.id=c.perspective_id
-LEFT JOIN hls_assets h ON h.id=c.hls_asset_id
-WHERE c.project_id=?
-ORDER BY c.wallclock_start_ms, c.id`, projectID)
-	if err != nil {
-		writeError(w, 500, err)
-		return
-	}
-	defer rows.Close()
-	var clips []map[string]any
-	for rows.Next() {
-		var clipID, pid, tid, start, dur, fpsN, fpsD int64
-		var streamIndex int
-		var pname, tname, kind, displayName, status, playlist, linkGroupID string
-		if err := rows.Scan(&clipID, &pid, &pname, &tid, &tname, &kind, &start, &dur, &fpsN, &fpsD, &streamIndex, &displayName, &status, &playlist, &linkGroupID); err != nil {
-			writeError(w, 500, err)
-			return
-		}
-		url := ""
-		if playlist != "" && status == "SUCCESS" {
-			var err error
-			url, err = s.cachedHLSURL(r.Context(), storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: playlist}, s.cfg.HLSPresignTTL)
-			if err != nil {
-				writeError(w, 500, err)
-				return
-			}
-		}
-		clips = append(clips, map[string]any{"clipId": clipID, "perspectiveId": pid, "perspectiveName": pname, "trackId": tid, "trackName": tname, "kind": kind, "wallclockStartMs": start, "durationMs": dur, "fpsNum": fpsN, "fpsDen": fpsD, "streamIndex": streamIndex, "displayName": displayName, "ingestStatus": status, "hlsURL": url, "linkGroupId": linkGroupID})
-	}
-	writeJSON(w, 200, map[string]any{"projectId": projectID, "clips": clips})
-}
-
-func (s *Server) playbackManifestValidator(ctx context.Context, projectID int64) (etag, lastModified string) {
-	var count int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM clips WHERE project_id=?`, projectID).Scan(&count, &lastModified); err != nil {
-		return "", ""
-	}
-	var ttlBucket int64
-	if s.cfg.HLSPresignTTL > 0 {
-		ttlBucket = time.Now().Unix() / int64(s.cfg.HLSPresignTTL.Seconds())
-	}
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s:%d", projectID, count, lastModified, ttlBucket)))
-	return `"` + hex.EncodeToString(h[:])[:16] + `"`, lastModified
-}
-
 func (s *Server) cachedHLSURL(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
 	key := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", ref.Adapter, ref.Bucket, ref.Key, ref.Path, int64(ttl.Seconds()))
 	now := time.Now()
 	s.urlCache.mu.Lock()
 	if s.urlCache.m != nil {
-		if entry, ok := s.urlCache.m[key]; ok && now.Before(entry.expiresAt) {
-			url := entry.url
+		if e, ok := s.urlCache.m[key]; ok && now.Before(e.expiresAt) {
+			u := e.url
 			s.urlCache.mu.Unlock()
-			return url, nil
+			return u, nil
 		}
 	}
 	s.urlCache.mu.Unlock()
 
-	url, err := s.hls.PublicOrSignedURL(ctx, ref, ttl)
+	u, err := s.hls.PublicOrSignedURL(ctx, ref, ttl)
 	if err != nil {
 		return "", err
 	}
-	expiresIn := ttl - 30*time.Second
-	if expiresIn <= 0 {
-		expiresIn = ttl / 2
+	exp := ttl - 30*time.Second
+	if exp <= 0 {
+		exp = ttl / 2
 	}
-	if expiresIn <= 0 {
-		expiresIn = time.Minute
+	if exp <= 0 {
+		exp = time.Minute
 	}
 	s.urlCache.mu.Lock()
 	if s.urlCache.m == nil {
 		s.urlCache.m = make(map[string]signedURLCacheEntry)
 	}
-	s.urlCache.m[key] = signedURLCacheEntry{url: url, expiresAt: now.Add(expiresIn)}
+	s.urlCache.m[key] = signedURLCacheEntry{url: u, expiresAt: now.Add(exp)}
 	s.urlCache.mu.Unlock()
-	return url, nil
-}
-
-func parseSQLiteTime(v string) (time.Time, bool) {
-	if v == "" {
-		return time.Time{}, false
-	}
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
-		if t, err := time.ParseInLocation(layout, v, time.UTC); err == nil {
-			return t, true
-		}
-	}
-	return time.Time{}, false
+	return u, nil
 }
 
 func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
@@ -1246,15 +1256,10 @@ func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.queryRows(r.Context(), `
-SELECT m.id, m.marker_ts_ms, m.author_username, m.author_username AS author,
-       COALESCE(u.color, m.author_color) AS author_color,
-       COALESCE(u.color, m.author_color) AS authorColor,
-       COALESCE(u.color, m.author_color) AS color,
+SELECT m.id, m.marker_ts_ms, m.author_username, u.color AS authorColor,
        m.label, COALESCE(m.note,'') AS note, m.created_at, m.updated_at
-FROM markers m
-LEFT JOIN users u ON u.username=m.author_username
-WHERE m.project_id=?
-ORDER BY m.marker_ts_ms`, projectID))
+FROM markers m JOIN users u ON u.username=m.author_username
+WHERE m.project_id=? ORDER BY m.marker_ts_ms`, projectID))
 }
 
 func (s *Server) createMarker(w http.ResponseWriter, r *http.Request) {
@@ -1274,13 +1279,13 @@ func (s *Server) createMarker(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err)
 		return
 	}
-	res, err := s.db.ExecContext(r.Context(), `INSERT INTO markers(project_id, marker_ts_ms, author_username, author_color, label, note) VALUES (?, ?, ?, ?, ?, ?)`, projectID, req.TsMS, p.Username, p.Color, req.Label, req.Note)
+	res, err := s.db.ExecContext(r.Context(), `INSERT INTO markers(project_id, marker_ts_ms, author_username, label, note) VALUES (?, ?, ?, ?, ?)`, projectID, req.TsMS, p.Username, req.Label, req.Note)
 	if err != nil {
 		writeError(w, 500, err)
 		return
 	}
 	id, _ := res.LastInsertId()
-	payload := map[string]any{"id": id, "tsMs": req.TsMS, "label": req.Label, "note": req.Note, "author": p.Username, "color": p.Color}
+	payload := map[string]any{"id": id, "marker_ts_ms": req.TsMS, "label": req.Label, "note": req.Note, "author_username": p.Username, "authorColor": p.Color}
 	s.broadcast(r, projectID, "marker.created", payload)
 	writeJSON(w, 201, payload)
 }
@@ -1353,15 +1358,10 @@ func (s *Server) listRegions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.queryRows(r.Context(), `
-SELECT r.id, r.region_start_ms, r.region_end_ms, r.author_username, r.author_username AS author,
-       COALESCE(u.color, r.author_color) AS author_color,
-       COALESCE(u.color, r.author_color) AS authorColor,
-       COALESCE(u.color, r.author_color) AS color,
+SELECT r.id, r.region_start_ms, r.region_end_ms, r.author_username, u.color AS authorColor,
        r.label, COALESCE(r.note,'') AS note, r.created_at, r.updated_at
-FROM regions r
-LEFT JOIN users u ON u.username=r.author_username
-WHERE r.project_id=?
-ORDER BY r.region_start_ms`, projectID))
+FROM regions r JOIN users u ON u.username=r.author_username
+WHERE r.project_id=? ORDER BY r.region_start_ms`, projectID))
 }
 
 func (s *Server) createRegion(w http.ResponseWriter, r *http.Request) {
@@ -1387,13 +1387,13 @@ func (s *Server) createRegion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("end before start"))
 		return
 	}
-	res, err := s.db.ExecContext(r.Context(), `INSERT INTO regions(project_id, region_start_ms, region_end_ms, author_username, author_color, label, note) VALUES (?, ?, ?, ?, ?, ?, ?)`, projectID, req.StartMS, req.EndMS, p.Username, p.Color, req.Label, req.Note)
+	res, err := s.db.ExecContext(r.Context(), `INSERT INTO regions(project_id, region_start_ms, region_end_ms, author_username, label, note) VALUES (?, ?, ?, ?, ?, ?)`, projectID, req.StartMS, req.EndMS, p.Username, req.Label, req.Note)
 	if err != nil {
 		writeError(w, 500, err)
 		return
 	}
 	id, _ := res.LastInsertId()
-	payload := map[string]any{"id": id, "startMs": req.StartMS, "endMs": req.EndMS, "label": req.Label, "note": req.Note, "author": p.Username, "color": p.Color}
+	payload := map[string]any{"id": id, "region_start_ms": req.StartMS, "region_end_ms": req.EndMS, "label": req.Label, "note": req.Note, "author_username": p.Username, "authorColor": p.Color}
 	s.broadcast(r, projectID, "region.created", payload)
 	writeJSON(w, 201, payload)
 }
@@ -1454,15 +1454,10 @@ func (s *Server) deleteRegion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-func (s *Server) exportCSV(w http.ResponseWriter, r *http.Request) {
-	s.withItems(w, r, "text/csv", "markers.csv", exp.WriteCSV)
-}
-func (s *Server) exportMarkdown(w http.ResponseWriter, r *http.Request) {
-	s.withItems(w, r, "text/markdown", "markers.md", exp.WriteMarkdown)
-}
-func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request) {
-	s.withItems(w, r, "application/json", "markers.json", exp.WriteJSON)
-}
+func (s *Server) exportCSV(w http.ResponseWriter, r *http.Request)      { s.withItems(w, r, "text/csv", "markers.csv", exp.WriteCSV) }
+func (s *Server) exportMarkdown(w http.ResponseWriter, r *http.Request) { s.withItems(w, r, "text/markdown", "markers.md", exp.WriteMarkdown) }
+func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request)     { s.withItems(w, r, "application/json", "markers.json", exp.WriteJSON) }
+
 func (s *Server) exportEDL(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -1475,7 +1470,6 @@ func (s *Server) exportEDL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-disposition", `attachment; filename="regions.edl"`)
 	if err := exp.WriteEDL(r.Context(), s.db, w, projectID); err != nil {
 		writeError(w, 500, err)
-		return
 	}
 }
 
@@ -1498,7 +1492,6 @@ func (s *Server) withItems(w http.ResponseWriter, r *http.Request, contentType, 
 	w.Header().Set("content-disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	if err := fn(w, items); err != nil {
 		writeError(w, 500, err)
-		return
 	}
 }
 
@@ -1533,13 +1526,14 @@ func (s *Server) localHLS(w http.ResponseWriter, r *http.Request) {
 	if ct := mime.TypeByExtension(filepath.Ext(p)); ct != "" {
 		w.Header().Set("content-type", ct)
 	}
-	if strings.HasSuffix(p, ".m3u8") {
+	switch {
+	case strings.HasSuffix(p, ".m3u8"):
 		w.Header().Set("content-type", "application/vnd.apple.mpegurl")
 		w.Header().Set("cache-control", "no-cache")
-	} else if strings.HasSuffix(p, ".ts") {
+	case strings.HasSuffix(p, ".ts"):
 		w.Header().Set("content-type", "video/MP2T")
 		w.Header().Set("cache-control", "public, max-age=31536000, immutable")
-	} else {
+	default:
 		w.Header().Set("cache-control", "private, max-age=300")
 	}
 	_, _ = io.Copy(w, rc)
@@ -1564,18 +1558,16 @@ func (s *Server) requireProjectEditor(w http.ResponseWriter, r *http.Request, pr
 	var allowed int
 	err := s.db.QueryRowContext(r.Context(), `
 SELECT CASE WHEN EXISTS (
-  SELECT 1
-  FROM projects p
+  SELECT 1 FROM projects p
   LEFT JOIN project_memberships pm ON pm.project_id=p.id AND pm.username=?
-  WHERE p.id=?
-    AND (p.owner_username=? OR pm.role IN ('owner','editor','member'))
+  WHERE p.id=? AND (p.owner_username=? OR pm.role='editor')
 ) THEN 1 ELSE 0 END`, p.Username, projectID, p.Username).Scan(&allowed)
 	if err != nil {
 		writeError(w, 500, err)
 		return false
 	}
 	if allowed != 1 {
-		writeError(w, 403, errors.New("project membership required"))
+		writeError(w, 403, errors.New("editor access required"))
 		return false
 	}
 	return true
@@ -1585,8 +1577,7 @@ func (s *Server) canEditMarker(ctx context.Context, projectID, markerID int64, u
 	var allowed int
 	err := s.db.QueryRowContext(ctx, `
 SELECT CASE WHEN p.owner_username=? OR m.author_username=? THEN 1 ELSE 0 END
-FROM markers m
-JOIN projects p ON p.id=m.project_id
+FROM markers m JOIN projects p ON p.id=m.project_id
 WHERE m.id=? AND m.project_id=?`, username, username, markerID, projectID).Scan(&allowed)
 	return err == nil && allowed == 1
 }
@@ -1595,8 +1586,7 @@ func (s *Server) canEditRegion(ctx context.Context, projectID, regionID int64, u
 	var allowed int
 	err := s.db.QueryRowContext(ctx, `
 SELECT CASE WHEN p.owner_username=? OR r.author_username=? THEN 1 ELSE 0 END
-FROM regions r
-JOIN projects p ON p.id=r.project_id
+FROM regions r JOIN projects p ON p.id=r.project_id
 WHERE r.id=? AND r.project_id=?`, username, username, regionID, projectID).Scan(&allowed)
 	return err == nil && allowed == 1
 }
@@ -1625,11 +1615,10 @@ func (s *Server) queryRows(ctx context.Context, query string, args ...any) []map
 		}
 		m := map[string]any{}
 		for i, c := range cols {
-			switch v := vals[i].(type) {
-			case []byte:
-				m[c] = string(v)
-			default:
-				m[c] = v
+			if b, ok := vals[i].([]byte); ok {
+				m[c] = string(b)
+			} else {
+				m[c] = vals[i]
 			}
 		}
 		out = append(out, m)
@@ -1658,6 +1647,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
@@ -1669,12 +1659,15 @@ func inferPerspective(path string) string {
 	}
 	return "Default"
 }
+
 func titleKind(kind string) string {
 	if kind == "audio" {
 		return "Audio"
 	}
 	return "Video"
 }
+
+// --- HTTP logging middleware ---
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
@@ -1688,7 +1681,6 @@ func (w *loggingResponseWriter) WriteHeader(status int) {
 		w.ResponseWriter.WriteHeader(status)
 	}
 }
-
 func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
@@ -1697,13 +1689,11 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	w.bytes += int64(n)
 	return n, err
 }
-
 func (w *loggingResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
-
 func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -1714,7 +1704,6 @@ func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	return h.Hijack()
 }
-
 func (w *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		if w.status == 0 {
@@ -1727,20 +1716,17 @@ func (w *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	type onlyWriter struct{ io.Writer }
 	return io.Copy(onlyWriter{w}, r)
 }
-
-func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &loggingResponseWriter{ResponseWriter: w}
-		next.ServeHTTP(recorder, r)
-		status := recorder.status
+		lw := &loggingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(lw, r)
+		status := lw.status
 		if status == 0 {
 			status = http.StatusOK
 		}
-		slog.InfoContext(r.Context(), "http request", "method", r.Method, "uri", r.URL.RequestURI(), "status", status, "bytes", recorder.bytes, "duration_ms", time.Since(start).Milliseconds())
+		slog.InfoContext(r.Context(), "http request", "method", r.Method, "uri", r.URL.RequestURI(), "status", status, "bytes", lw.bytes, "duration_ms", time.Since(start).Milliseconds())
 	})
 }

@@ -17,6 +17,7 @@ export async function api(path, options = {}) {
   return ct.includes('json') ? res.json() : res.text();
 }
 
-export const postJSON = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
-export const patchJSON = (path, body) => api(path, { method: 'PATCH', body: JSON.stringify(body) });
-export const del = (path) => api(path, { method: 'DELETE' });
+export const postJSON  = (path, body) => api(path, { method: 'POST',   body: JSON.stringify(body) });
+export const patchJSON = (path, body) => api(path, { method: 'PATCH',  body: JSON.stringify(body) });
+export const deleteJSON = (path, body) => api(path, { method: 'DELETE', body: JSON.stringify(body) });
+export const del       = (path)       => api(path, { method: 'DELETE' });
