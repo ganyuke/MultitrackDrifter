@@ -205,6 +205,9 @@ ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_speed TEXT NOT NULL DEFAULT '';
 ALTER TABLE ingest_jobs ADD COLUMN last_log TEXT NOT NULL DEFAULT '';
 ALTER TABLE ingest_jobs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
 UPDATE ingest_jobs SET updated_at=COALESCE(NULLIF(finished_at,''), NULLIF(started_at,''), created_at, datetime('now')) WHERE updated_at='';
+`}, {6, `
+ALTER TABLE clips ADD COLUMN link_group_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_clips_project_link_group ON clips(project_id, link_group_id);
 `}}
 
 func Migrate(ctx context.Context, db *sql.DB) error {

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -490,6 +491,10 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 	if len(reqs) == 0 {
 		return nil, nil, nil, errors.New("at least one stream required")
 	}
+	linkGroupID := ""
+	if len(reqs) > 1 {
+		linkGroupID = newClipLinkGroupID()
+	}
 	fp := ingest.FingerprintJSON(info)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -572,8 +577,8 @@ WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`, rev
 			hlsValue = hlsID.Int64
 		}
 		res, e := tx.ExecContext(ctx, `
-INSERT INTO clips(project_id, perspective_id, track_id, source_asset_id, source_revision_id, hls_asset_id, media_kind, wallclock_start_ms, duration_ms, fps_num, fps_den, display_name, stream_index, ingest_status)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0), ?, ?, ?)`, projectID, perspectiveID, trackID, assetID, revID, hlsValue, req.Kind, req.WallclockStartMS, durationMS, fpsNum, fpsDen, req.DisplayName, req.StreamIndex, status)
+INSERT INTO clips(project_id, perspective_id, track_id, source_asset_id, source_revision_id, hls_asset_id, media_kind, wallclock_start_ms, duration_ms, fps_num, fps_den, display_name, stream_index, ingest_status, link_group_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0), ?, ?, ?, ?)`, projectID, perspectiveID, trackID, assetID, revID, hlsValue, req.Kind, req.WallclockStartMS, durationMS, fpsNum, fpsDen, req.DisplayName, req.StreamIndex, status, linkGroupID)
 		if e != nil {
 			err = e
 			return nil, nil, nil, err
@@ -633,6 +638,14 @@ func trackIDFor(ctx context.Context, tx *sql.Tx, projectID, perspectiveID int64,
 	}
 	cache[cacheKey] = id
 	return id, nil
+}
+
+func newClipLinkGroupID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("lg-%d", time.Now().UnixNano())
+	}
+	return "lg-" + hex.EncodeToString(b[:])
 }
 
 func (s *Server) enqueueClipJobs(ctx context.Context, projectID int64, clipIDs []int64) ([]int64, error) {
@@ -904,9 +917,10 @@ func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		WallclockStartMS *int64 `json:"wallclockStartMs"`
-		DisplayName      string `json:"displayName"`
-		StreamIndex      *int   `json:"streamIndex"`
+		WallclockStartMS *int64  `json:"wallclockStartMs"`
+		DisplayName      string  `json:"displayName"`
+		StreamIndex      *int    `json:"streamIndex"`
+		LinkGroupID      *string `json:"linkGroupId"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, 400, err)
@@ -919,12 +933,21 @@ func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.broadcast(r, projectID, "clip.timeline.updated", map[string]any{"clipId": clipID, "wallclockStartMs": *req.WallclockStartMS})
-	} else {
+	} else if req.DisplayName != "" {
 		_, err := s.db.ExecContext(r.Context(), `UPDATE clips SET display_name=COALESCE(NULLIF(?,''),display_name), updated_at=datetime('now') WHERE id=? AND project_id=?`, req.DisplayName, clipID, projectID)
 		if err != nil {
 			writeError(w, 500, err)
 			return
 		}
+	}
+	if req.LinkGroupID != nil {
+		linkGroupID := strings.TrimSpace(*req.LinkGroupID)
+		_, err := s.db.ExecContext(r.Context(), `UPDATE clips SET link_group_id=?, updated_at=datetime('now') WHERE id=? AND project_id=?`, linkGroupID, clipID, projectID)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		s.broadcast(r, projectID, "clip.link.updated", map[string]any{"clipId": clipID, "linkGroupId": linkGroupID})
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -976,7 +999,7 @@ func (s *Server) playbackManifest(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(), `
 SELECT c.id, c.perspective_id, p.name, c.track_id, t.name, c.media_kind, c.wallclock_start_ms, c.duration_ms,
        COALESCE(c.fps_num,0), COALESCE(c.fps_den,0), c.stream_index, c.display_name, c.ingest_status,
-       COALESCE(h.playlist_path, '')
+       COALESCE(h.playlist_path, ''), COALESCE(c.link_group_id, '')
 FROM clips c
 JOIN tracks t ON t.id=c.track_id
 JOIN perspectives p ON p.id=c.perspective_id
@@ -992,8 +1015,8 @@ ORDER BY c.wallclock_start_ms, c.id`, projectID)
 	for rows.Next() {
 		var clipID, pid, tid, start, dur, fpsN, fpsD int64
 		var streamIndex int
-		var pname, tname, kind, displayName, status, playlist string
-		if err := rows.Scan(&clipID, &pid, &pname, &tid, &tname, &kind, &start, &dur, &fpsN, &fpsD, &streamIndex, &displayName, &status, &playlist); err != nil {
+		var pname, tname, kind, displayName, status, playlist, linkGroupID string
+		if err := rows.Scan(&clipID, &pid, &pname, &tid, &tname, &kind, &start, &dur, &fpsN, &fpsD, &streamIndex, &displayName, &status, &playlist, &linkGroupID); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -1006,7 +1029,7 @@ ORDER BY c.wallclock_start_ms, c.id`, projectID)
 				return
 			}
 		}
-		clips = append(clips, map[string]any{"clipId": clipID, "perspectiveId": pid, "perspectiveName": pname, "trackId": tid, "trackName": tname, "kind": kind, "wallclockStartMs": start, "durationMs": dur, "fpsNum": fpsN, "fpsDen": fpsD, "streamIndex": streamIndex, "displayName": displayName, "ingestStatus": status, "hlsURL": url})
+		clips = append(clips, map[string]any{"clipId": clipID, "perspectiveId": pid, "perspectiveName": pname, "trackId": tid, "trackName": tname, "kind": kind, "wallclockStartMs": start, "durationMs": dur, "fpsNum": fpsN, "fpsDen": fpsD, "streamIndex": streamIndex, "displayName": displayName, "ingestStatus": status, "hlsURL": url, "linkGroupId": linkGroupID})
 	}
 	writeJSON(w, 200, map[string]any{"projectId": projectID, "clips": clips})
 }

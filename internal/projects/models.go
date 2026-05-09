@@ -43,4 +43,5 @@ type Clip struct {
 	StreamIndex      int    `json:"streamIndex"`
 	DisplayName      string `json:"displayName"`
 	IngestStatus     string `json:"ingestStatus"`
+	LinkGroupID      string `json:"linkGroupId"`
 }

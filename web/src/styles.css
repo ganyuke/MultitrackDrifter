@@ -269,6 +269,7 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .label-corner { height:26px; background:#0c1018; border-bottom:1px solid var(--line); }
 .lane-scroll { min-width:0; overflow-x:auto; overflow-y:hidden; align-self:start; position:relative; }
 .lane-canvas { min-width:100%; position:relative; padding-top:26px; }
+.marquee-box { position:absolute; border:1px solid var(--blue); background:rgba(74,144,226,.14); pointer-events:none; z-index:20; box-shadow:0 0 0 1px rgba(0,0,0,.35) inset; }
 
 .ruler { position:absolute; left:0; right:0; top:0; height:26px; background:#0a0f18; border-bottom:1px solid var(--line); cursor:ew-resize; user-select:none; }
 .tick { position:absolute; top:0; width:1px; height:26px; background:var(--line2); }
@@ -312,12 +313,14 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .clip-block.pending, .clip-block.queued, .clip-block.processing { background:#302010; border-color:#806030; color:#ffe0a0; }
 .clip-block.failed { background:#300e12; border-color:#7a2830; color:#ffbbc0; }
 .clip-selected { outline:2px solid var(--yellow); outline-offset:-1px; z-index:5; }
+.clip-linked { box-shadow:inset 0 -2px 0 rgba(255,255,255,.22); }
 .clip-dragging { opacity:.88; z-index:10; cursor:grabbing; }
 .clip-ghost { pointer-events:none; background:transparent !important; border:1px dashed rgba(255,255,255,.4) !important; color:rgba(255,255,255,.5); z-index:4; }
 .clip-title { display:block; font-size:10px; font-weight:700; line-height:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .clip-timecode { display:none; position:absolute; bottom:2px; left:5px; right:18px; font-size:9px; line-height:10px; font-family:ui-monospace,monospace; color:rgba(255,255,255,.5); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .clip-block:hover .clip-timecode, .clip-selected .clip-timecode { display:block; }
 .clip-badge { font-size:9px; line-height:10px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; opacity:.85; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.clip-link-badge { position:absolute; top:1px; right:14px; font-size:9px; line-height:12px; opacity:.75; pointer-events:none; }
 .clip-del { position:absolute; top:1px; right:3px; color:rgba(255,255,255,.65); font-size:12px; font-weight:800; cursor:pointer; line-height:14px; z-index:6; }
 .clip-del:hover { color:var(--red); }
 .waveform { display:flex; align-items:center; gap:1px; height:12px; width:100%; overflow:hidden; opacity:.7; }

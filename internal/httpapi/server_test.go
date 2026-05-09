@@ -158,6 +158,55 @@ func TestCreateSourceRevisionClipsCreatesFreshPendingClipWithoutHLS(t *testing.T
 	}
 }
 
+func TestCreateSourceRevisionClipsLinksStreamsFromSameImport(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ctx)
+
+	projectID := insertTestProject(t, ctx, db)
+	info := storage.ObjectInfo{
+		Name:      "camera-c.mp4",
+		SizeBytes: 128,
+		ETag:      "etag-c",
+		Ref: storage.ObjectRef{
+			Adapter: "local",
+			Path:    "camera-c.mp4",
+		},
+	}
+	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile"}}
+	reqs := []createClipReq{
+		{Perspective: "Main", Track: "Video", Kind: "video", DisplayName: "Camera C video", StreamIndex: 0, WallclockStartMS: 5000},
+		{Perspective: "Main", Track: "Audio", Kind: "audio", DisplayName: "Camera C audio", StreamIndex: 1, WallclockStartMS: 5000},
+	}
+
+	clipIDs, _, _, err := s.createSourceRevisionClips(ctx, projectID, reqs, info)
+	if err != nil {
+		t.Fatalf("createSourceRevisionClips: %v", err)
+	}
+	if len(clipIDs) != 2 {
+		t.Fatalf("expected two linked clips, got %v", clipIDs)
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT link_group_id FROM clips WHERE project_id=? ORDER BY id`, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var groups []string
+	for rows.Next() {
+		var group string
+		if err := rows.Scan(&group); err != nil {
+			t.Fatal(err)
+		}
+		groups = append(groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 || groups[0] == "" || groups[0] != groups[1] {
+		t.Fatalf("expected both imported streams to share a non-empty link group, got %#v", groups)
+	}
+}
+
 func openTestDB(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	db, err := dbpkg.Open(ctx, filepath.Join(t.TempDir(), "drifter-test.db"))

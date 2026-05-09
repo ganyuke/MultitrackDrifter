@@ -35,6 +35,9 @@
   let softNudges = {};
   let volumes = {};
   let selectedClipId = null;
+  let selectedClipIds = [];
+  let snapEnabled = true;
+  let linkedMoveEnabled = true;
   let perspectiveOrder = [];
   let trackOrder = [];
   let collapsedPerspectiveIds = [];
@@ -63,6 +66,7 @@
   let timelineViewport;
   let timelineCanvas;
   let dragState = null;
+  let marqueeState = null;
 
   let mediaRefs = new Map();
   let cleanups = new Map();
@@ -87,11 +91,12 @@
   $: monitorCells = buildMonitorCells(perspectiveGroups, visibleTrackIds, hiddenPerspectiveIds, wallclockMs).slice(0, maxCells(gridPreset));
   $: visibleVideos = monitorCells.map(cell => cell.activeClip).filter(Boolean);
   $: selectedClip = allClips.find(c => c.clipId === selectedClipId) || null;
+  $: selectedClips = selectedClipIds.map(id => allClips.find(c => String(c.clipId) === String(id))).filter(Boolean);
   $: timelineEndMs = timelineEnd(allClips, wallclockMs);
   $: timelineLaneWidthPx = Math.max(900, Math.ceil(timelineEndMs / 45));
   $: timelineWidthPx = timelineLaneWidthPx;
   $: tickMarks = makeTicks(timelineEndMs);
-  $: activeAudioClips = audioClips.filter(c => activeAudioIds.includes(c.trackId));
+  $: activeAudioClips = audioClips.filter(c => hasId(activeAudioIds, c.trackId));
   $: statusCounts = countStatuses(allClips);
   $: pendingJobCount = ingestJobs.filter(j => j.state === 'PENDING' || j.state === 'PROCESSING').length;
   $: failedJobCount = ingestJobs.filter(j => j.state === 'FAILED').length;
@@ -168,6 +173,10 @@
     softNudges = prefs.softNudges || {};
     volumes = prefs.volumes || {};
     selectedClipId = prefs.selectedClipId || null;
+    selectedClipIds = Array.isArray(prefs.selectedClipIds) ? prefs.selectedClipIds : (selectedClipId ? [selectedClipId] : []);
+    snapEnabled = prefs.snapEnabled ?? true;
+    linkedMoveEnabled = prefs.linkedMoveEnabled ?? true;
+    reconcileSelection();
     connectWS(id);
     if (canAnnotateProject()) await browseSources('');
     else sources = [];
@@ -182,6 +191,7 @@
     current = await api(`/api/projects/${id}`);
     manifest = await api(`/api/projects/${id}/playback-manifest`);
     reconcileOrdering();
+    reconcileSelection();
     markers = await api(`/api/projects/${id}/markers`);
     regions = await api(`/api/projects/${id}/regions`);
     await refreshMembers();
@@ -400,11 +410,113 @@
   }
 
   async function moveClipTo(clip, startMs) {
-    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
-    await patchJSON(`/api/projects/${current.id}/clips/${clip.clipId}`, { wallclockStartMs: Math.max(0, Math.round(startMs)) });
+    await moveClipStarts({ [clip.clipId]: Math.max(0, Math.round(startMs)) });
   }
 
-  async function moveClip(clip, delta) { await moveClipTo(clip, clip.wallclockStartMs + delta); }
+  async function moveClip(clip, delta) {
+    const clips = movementClipSetFor(clip);
+    const starts = {};
+    for (const item of clips) starts[item.clipId] = item.wallclockStartMs + delta;
+    await moveClipStarts(starts);
+  }
+
+  async function moveClipStarts(startsById) {
+    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
+    const entries = Object.entries(startsById)
+      .map(([id, start]) => [id, Math.max(0, Math.round(Number(start)))])
+      .filter(([id, start]) => Number.isFinite(start) && allClips.some(c => String(c.clipId) === String(id) && Math.round(c.wallclockStartMs) !== start));
+    for (const [id, start] of entries) {
+      await patchJSON(`/api/projects/${current.id}/clips/${id}`, { wallclockStartMs: start });
+    }
+    if (entries.length) await refreshProject();
+  }
+
+  function selectClip(clip, event = null) {
+    const id = clip.clipId;
+    const multi = !!(event?.shiftKey || event?.metaKey || event?.ctrlKey);
+    if (multi) {
+      selectedClipIds = hasId(selectedClipIds, id) ? selectedClipIds.filter(v => String(v) !== String(id)) : [...selectedClipIds, id];
+      if (!selectedClipIds.length) selectedClipIds = [id];
+    } else if (!hasId(selectedClipIds, id) || selectedClipIds.length > 1) {
+      selectedClipIds = [id];
+    }
+    selectedClipId = id;
+    activeInspectorTab = 'clip';
+    persistPrefs();
+  }
+
+  function isClipSelected(clip) { return hasId(selectedClipIds, clip.clipId); }
+
+  function reconcileSelection() {
+    const valid = new Set(allClips.map(c => String(c.clipId)));
+    selectedClipIds = selectedClipIds.filter(id => valid.has(String(id)));
+    if (selectedClipId && !valid.has(String(selectedClipId))) selectedClipId = selectedClipIds[0] || null;
+    if (selectedClipId && !hasId(selectedClipIds, selectedClipId)) selectedClipIds = [selectedClipId, ...selectedClipIds];
+  }
+
+  function linkedGroupClipIdsFor(clip) {
+    if (!linkedMoveEnabled || !clip?.linkGroupId) return [];
+    return allClips.filter(c => c.linkGroupId && c.linkGroupId === clip.linkGroupId).map(c => c.clipId);
+  }
+
+  function movementClipSetFor(anchor) {
+    const ids = new Set((isClipSelected(anchor) && selectedClipIds.length ? selectedClipIds : [anchor.clipId]).map(String));
+    if (linkedMoveEnabled) {
+      for (const clip of allClips) {
+        if (!ids.has(String(clip.clipId))) continue;
+        for (const linkedId of linkedGroupClipIdsFor(clip)) ids.add(String(linkedId));
+      }
+    }
+    return allClips.filter(c => ids.has(String(c.clipId)));
+  }
+
+  function dragOriginalStart(clip) { return dragState?.originalStarts?.[clip.clipId] ?? clip.wallclockStartMs; }
+  function dragPreviewStart(clip) { return dragState?.previewStarts?.[clip.clipId] ?? clip.wallclockStartMs; }
+  function isClipDragging(clip) { return !!dragState?.clipIds?.some(id => String(id) === String(clip.clipId)); }
+
+  function clipSnapTargets(movingIds) {
+    const ids = new Set(movingIds.map(String));
+    const targets = [0, wallclockMs];
+    for (const clip of allClips) {
+      if (ids.has(String(clip.clipId))) continue;
+      targets.push(clip.wallclockStartMs, clip.wallclockStartMs + Math.max(0, clip.durationMs || 0));
+    }
+    for (const marker of markers) targets.push(Number(marker.marker_ts_ms || 0));
+    for (const region of regions) targets.push(Number(region.region_start_ms || 0), Number(region.region_end_ms || 0));
+    return targets.filter(Number.isFinite);
+  }
+
+  function snapDragDelta(rawDelta, movingClips, originalStarts) {
+    let delta = rawDelta;
+    const minStart = Math.min(...movingClips.map(c => originalStarts[c.clipId]));
+    delta = Math.max(delta, -minStart);
+    if (!snapEnabled) return delta;
+    const ids = movingClips.map(c => c.clipId);
+    const targets = clipSnapTargets(ids);
+    const thresholdMs = Math.max(40, Math.round((10 / Math.max(1, timelineLaneWidthPx)) * timelineEndMs));
+    let best = { distance: Infinity, delta };
+    for (const clip of movingClips) {
+      const start = originalStarts[clip.clipId];
+      const end = start + Math.max(0, clip.durationMs || 0);
+      for (const target of targets) {
+        for (const candidate of [target - start, target - end]) {
+          const clamped = Math.max(candidate, -minStart);
+          const distance = Math.abs(clamped - rawDelta);
+          if (distance < best.distance && distance <= thresholdMs) best = { distance, delta: clamped };
+        }
+      }
+    }
+    return best.delta;
+  }
+
+  function hasId(list, id) { return (list || []).some(v => String(v) === String(id)); }
+  function removeIds(list, ids) { const deny = new Set((ids || []).map(String)); return (list || []).filter(v => !deny.has(String(v))); }
+  function addIds(list, ids) {
+    const seen = new Set((list || []).map(String));
+    const next = [...(list || [])];
+    for (const id of ids || []) if (!seen.has(String(id))) { seen.add(String(id)); next.push(id); }
+    return next;
+  }
 
   function setSoftNudge(clipId, ms) {
     softNudges = { ...softNudges, [clipId]: Number(ms) };
@@ -424,13 +536,33 @@
     if (!clip || !isProjectOwner()) return;
     if (!confirm(`Remove "${clip.displayName || 'clip'}" from this project timeline?`)) return;
     await del(`/api/projects/${current.id}/clips/${clip.clipId || clip.id}`);
-    if (selectedClipId === (clip.clipId || clip.id)) selectedClipId = null;
+    selectedClipIds = selectedClipIds.filter(id => String(id) !== String(clip.clipId || clip.id));
+    if (String(selectedClipId) === String(clip.clipId || clip.id)) selectedClipId = selectedClipIds[0] || null;
+    await refreshProject();
+  }
+
+  async function deleteSelectedClips() {
+    if (!selectedClips.length || !isProjectOwner()) return;
+    const count = selectedClips.length;
+    const label = count === 1 ? `"${selectedClips[0].displayName || 'clip'}"` : `${count} selected clips`;
+    if (!confirm(`Remove ${label} from this project timeline?`)) return;
+    for (const clip of selectedClips) await del(`/api/projects/${current.id}/clips/${clip.clipId}`);
+    selectedClipId = null;
+    selectedClipIds = [];
+    await refreshProject();
+  }
+
+  async function detachSelectedClips() {
+    if (!selectedClips.length || !isProjectOwner()) return;
+    const linked = selectedClips.filter(c => c.linkGroupId);
+    if (!linked.length) return;
+    for (const clip of linked) await patchJSON(`/api/projects/${current.id}/clips/${clip.clipId}`, { linkGroupId: '' });
     await refreshProject();
   }
 
   function persistPrefs() {
     if (!current) return;
-    savePrefs(current.id, { gridPreset, visibleTrackIds, activeAudioIds, softNudges, volumes, selectedClipId, perspectiveOrder, trackOrder, collapsedPerspectiveIds, hiddenPerspectiveIds, rememberedPerspectiveViewIds, rememberedPerspectiveAudioIds });
+    savePrefs(current.id, { gridPreset, visibleTrackIds, activeAudioIds, softNudges, volumes, selectedClipId, selectedClipIds, snapEnabled, linkedMoveEnabled, perspectiveOrder, trackOrder, collapsedPerspectiveIds, hiddenPerspectiveIds, rememberedPerspectiveViewIds, rememberedPerspectiveAudioIds });
   }
 
   function disconnectMedia() {
@@ -467,7 +599,7 @@
     for (const clip of audioClips) {
       const node = mediaRefs.get(clip.clipId);
       if (!node || !clip.hlsURL) continue;
-      node.muted = !activeAudioIds.includes(clip.trackId);
+      node.muted = !hasId(activeAudioIds, clip.trackId);
       node.volume = Number(volumes[clip.clipId] ?? 0.85);
       if (attachedUrls.get(clip.clipId) === clip.hlsURL && attachedNodes.get(clip.clipId) === node) continue;
       const ex = cleanups.get(clip.clipId); if (ex) ex();
@@ -600,15 +732,15 @@
   }
 
   function isClipPlaybackEnabled(clip) {
-    if (clip.kind === 'video') return visibleTrackIds.includes(clip.trackId) && !hiddenPerspectiveIds.includes(perspectiveKey(clip));
-    return activeAudioIds.includes(clip.trackId);
+    if (clip.kind === 'video') return hasId(visibleTrackIds, clip.trackId) && !hiddenPerspectiveIds.includes(perspectiveKey(clip));
+    return hasId(activeAudioIds, clip.trackId);
   }
 
   async function toggleTrack(listName, id) {
     playbackToken += 1;
     const list = listName === 'video' ? visibleTrackIds : activeAudioIds;
-    const disabling = list.includes(id);
-    const next = disabling ? list.filter(v => v !== id) : [...list, id];
+    const disabling = hasId(list, id);
+    const next = disabling ? removeIds(list, [id]) : addIds(list, [id]);
     if (listName === 'video') visibleTrackIds = next; else activeAudioIds = next;
     if (disabling) disableTrackMedia(id);
     persistPrefs();
@@ -626,6 +758,7 @@
 
   function startPlayheadDrag(event) {
     if (!timelineCanvas || !timelineViewport) return;
+    if (event.shiftKey) { startMarqueeSelect(event); return; }
     event.preventDefault();
     event.currentTarget?.setPointerCapture?.(event.pointerId);
     document.body.classList.add('dragging-timeline');
@@ -635,17 +768,81 @@
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
 
+  function startLanePointerDown(event) {
+    if (event.shiftKey) startMarqueeSelect(event);
+    else startPlayheadDrag(event);
+  }
+
   function startClipDrag(event, clip) {
-    selectedClipId = clip.clipId; persistPrefs();
-    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
     event.preventDefault(); event.stopPropagation();
+    selectClip(clip, event);
+    if (!isProjectOwner()) return;
     event.currentTarget?.setPointerCapture?.(event.pointerId);
     document.body.classList.add('dragging-timeline');
-    dragState = { clipId: clip.clipId, originalStartMs: clip.wallclockStartMs, previewStartMs: clip.wallclockStartMs, pointerStartMs: clientToTimelineMs(event.clientX) };
-    const move = (ev) => { const delta = clientToTimelineMs(ev.clientX) - dragState.pointerStartMs; dragState = { ...dragState, previewStartMs: Math.max(0, snapMs(dragState.originalStartMs + delta, 50)) }; wallclockMs = dragState.previewStartMs; };
-    const up = async () => { document.body.classList.remove('dragging-timeline'); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); const f = dragState; dragState = null; if (f && Math.abs(f.previewStartMs - f.originalStartMs) >= 1) await moveClipTo(clip, f.previewStartMs); };
+    const movingClips = movementClipSetFor(clip);
+    const originalStarts = Object.fromEntries(movingClips.map(c => [c.clipId, c.wallclockStartMs]));
+    dragState = { clipId: clip.clipId, clipIds: movingClips.map(c => c.clipId), originalStarts, previewStarts: { ...originalStarts }, pointerStartMs: clientToTimelineMs(event.clientX), moved: false };
+    const move = (ev) => {
+      ev.preventDefault();
+      if (!dragState) return;
+      const rawDelta = clientToTimelineMs(ev.clientX) - dragState.pointerStartMs;
+      const delta = snapDragDelta(rawDelta, movingClips, originalStarts);
+      const previewStarts = {};
+      for (const item of movingClips) previewStarts[item.clipId] = Math.max(0, Math.round(originalStarts[item.clipId] + delta));
+      dragState = { ...dragState, previewStarts, moved: Math.abs(delta) >= 1 };
+      wallclockMs = previewStarts[clip.clipId] ?? wallclockMs;
+    };
+    const up = async () => {
+      document.body.classList.remove('dragging-timeline');
+      window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
+      const finalDrag = dragState; dragState = null;
+      if (finalDrag?.moved) await moveClipStarts(finalDrag.previewStarts);
+    };
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
+
+  function startMarqueeSelect(event) {
+    if (!timelineCanvas || !timelineViewport) return;
+    event.preventDefault(); event.stopPropagation();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    marqueeState = { startX, startY, x: startX, y: startY };
+    document.body.classList.add('dragging-timeline');
+    const move = (ev) => { ev.preventDefault(); marqueeState = { ...marqueeState, x: ev.clientX, y: ev.clientY }; };
+    const up = () => {
+      document.body.classList.remove('dragging-timeline');
+      window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
+      const box = marqueeClientRect(marqueeState);
+      const ids = [];
+      document.querySelectorAll('[data-clip-id]').forEach((node) => {
+        const rect = node.getBoundingClientRect();
+        if (rectsIntersect(box, rect)) ids.push(node.dataset.clipId);
+      });
+      selectedClipIds = [...new Set(ids.map(id => Number(id) || id))];
+      selectedClipId = selectedClipIds[selectedClipIds.length - 1] || null;
+      activeInspectorTab = 'clip';
+      marqueeState = null;
+      persistPrefs();
+    };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  }
+
+  function marqueeClientRect(state) {
+    const left = Math.min(state?.startX ?? 0, state?.x ?? 0);
+    const top = Math.min(state?.startY ?? 0, state?.y ?? 0);
+    const right = Math.max(state?.startX ?? 0, state?.x ?? 0);
+    const bottom = Math.max(state?.startY ?? 0, state?.y ?? 0);
+    return { left, top, right, bottom, width: right - left, height: bottom - top };
+  }
+
+  function marqueeStyle(state) {
+    if (!state || !timelineCanvas) return '';
+    const rect = timelineCanvas.getBoundingClientRect();
+    const box = marqueeClientRect(state);
+    return `left:${box.left - rect.left}px;top:${box.top - rect.top}px;width:${box.width}px;height:${box.height}px;`;
+  }
+
+  function rectsIntersect(a, b) { return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top; }
 
   function setWallclockFromClient(clientX) { wallclockMs = snapMs(clientToTimelineMs(clientX), 25); }
   function clientToTimelineMs(clientX) {
@@ -659,12 +856,12 @@
     if (listName === 'perspective') { perspectiveOrder = moveItem(perspectiveOrder.length ? perspectiveOrder : perspectiveGroups.map(g => g.id), id, delta); persistPrefs(); return; }
     const group = scopeId ? perspectiveGroups.find(g => g.id === scopeId) : null;
     const scopedIds = group ? group.tracks.map(t => t.id) : trackOrder;
-    if (!scopedIds.includes(id)) return;
+    if (!hasId(scopedIds, id)) return;
     const moved = moveItem(scopedIds, id, delta);
     const nextOrder = [];
     for (const p of perspectiveGroups) { const ids = p.id === scopeId ? moved : p.tracks.map(t => t.id); for (const tid of ids) if (!nextOrder.includes(tid)) nextOrder.push(tid); }
     const all = [...new Set(allClips.map(c => c.trackId))];
-    for (const tid of trackOrder.filter(t => !moved.includes(t)).concat(all.filter(t => !nextOrder.includes(t)))) if (!nextOrder.includes(tid)) nextOrder.push(tid);
+    for (const tid of trackOrder.filter(t => !hasId(moved, t)).concat(all.filter(t => !hasId(nextOrder, t)))) if (!hasId(nextOrder, tid)) nextOrder.push(tid);
     trackOrder = nextOrder; persistPrefs();
   }
 
@@ -680,35 +877,35 @@
     playbackToken += 1;
     const id = group.id; const ids = group.videoTracks.map(t => t.id);
     if (!ids.length) return;
-    const enabled = ids.filter(t => visibleTrackIds.includes(t));
+    const enabled = ids.filter(t => hasId(visibleTrackIds, t));
     if (!hiddenPerspectiveIds.includes(id) && enabled.length > 0) {
       rememberedPerspectiveViewIds = { ...rememberedPerspectiveViewIds, [id]: enabled };
-      visibleTrackIds = visibleTrackIds.filter(t => !ids.includes(t));
+      visibleTrackIds = removeIds(visibleTrackIds, ids);
       hiddenPerspectiveIds = [...new Set([...hiddenPerspectiveIds, id])];
       ids.forEach(disableTrackMedia);
     } else {
-      const rem = (rememberedPerspectiveViewIds[id] || []).filter(t => ids.includes(t));
-      visibleTrackIds = [...new Set([...visibleTrackIds, ...(rem.length ? rem : enabled.length ? enabled : ids)])];
+      const rem = (rememberedPerspectiveViewIds[id] || []).filter(t => hasId(ids, t));
+      visibleTrackIds = addIds(visibleTrackIds, rem.length ? rem : enabled.length ? enabled : ids);
       hiddenPerspectiveIds = hiddenPerspectiveIds.filter(v => v !== id);
     }
     persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
   }
 
-  function groupViewEnabled(group) { return !hiddenPerspectiveIds.includes(group.id) && group.videoTracks.some(t => visibleTrackIds.includes(t.id)); }
-  function groupAudioEnabled(group) { return group.audioTracks.some(t => activeAudioIds.includes(t.id)); }
+  function groupViewEnabled(group) { return !hiddenPerspectiveIds.includes(group.id) && group.videoTracks.some(t => hasId(visibleTrackIds, t.id)); }
+  function groupAudioEnabled(group) { return group.audioTracks.some(t => hasId(activeAudioIds, t.id)); }
 
   async function togglePerspectiveAudio(group) {
     playbackToken += 1;
     const ids = group.audioTracks.map(t => t.id);
     if (!ids.length) return;
-    const enabled = ids.filter(id => activeAudioIds.includes(id));
-    if (enabled.length) {
+    const enabled = ids.filter(id => hasId(activeAudioIds, id));
+    if (groupAudioEnabled(group)) {
       rememberedPerspectiveAudioIds = { ...rememberedPerspectiveAudioIds, [group.id]: enabled };
-      activeAudioIds = activeAudioIds.filter(id => !ids.includes(id));
+      activeAudioIds = removeIds(activeAudioIds, ids);
       ids.forEach(disableTrackMedia);
     } else {
-      const rem = (rememberedPerspectiveAudioIds[group.id] || []).filter(id => ids.includes(id));
-      activeAudioIds = [...new Set([...activeAudioIds, ...(rem.length ? rem : ids)])];
+      const rem = (rememberedPerspectiveAudioIds[group.id] || []).filter(id => hasId(ids, id));
+      activeAudioIds = addIds(activeAudioIds, rem.length ? rem : ids);
     }
     persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
   }
@@ -741,12 +938,12 @@
       return String(ca.trackName || '').localeCompare(String(cb.trackName || ''));
     });
     trackOrder = [...existing, ...fallback.filter(t => !existing.includes(t))];
-    visibleTrackIds = visibleTrackIds.filter(id => tKeys.includes(id));
-    activeAudioIds = activeAudioIds.filter(id => tKeys.includes(id));
+    visibleTrackIds = visibleTrackIds.filter(id => hasId(tKeys, id));
+    activeAudioIds = activeAudioIds.filter(id => hasId(tKeys, id));
     for (const id of tKeys) {
       const clip = trackById.get(id);
-      if (!known.has(id) && clip?.kind === 'video' && !visibleTrackIds.includes(id)) visibleTrackIds = [...visibleTrackIds, id];
-      if (!known.has(id) && clip?.kind === 'audio' && !activeAudioIds.includes(id)) activeAudioIds = [...activeAudioIds, id];
+      if (!known.has(id) && clip?.kind === 'video' && !hasId(visibleTrackIds, id)) visibleTrackIds = addIds(visibleTrackIds, [id]);
+      if (!known.has(id) && clip?.kind === 'audio' && !hasId(activeAudioIds, id)) activeAudioIds = addIds(activeAudioIds, [id]);
     }
     collapsedPerspectiveIds = collapsedPerspectiveIds.filter(p => pKeys.includes(p));
     hiddenPerspectiveIds = hiddenPerspectiveIds.filter(p => pKeys.includes(p));
@@ -801,7 +998,7 @@
     const cells = [];
     for (const g of groups) {
       if (hiddenPerspectives.includes(g.id)) continue;
-      const track = g.videoTracks.find(t => enabledTrackIds.includes(t.id));
+      const track = g.videoTracks.find(t => hasId(enabledTrackIds, t.id));
       if (!track) continue;
       const clips = [...track.clips].sort((a, b) => a.wallclockStartMs - b.wallclockStartMs);
       cells.push({ trackId: track.id, perspectiveId: g.id, perspectiveName: g.name, trackName: track.trackName, clips, activeClip: clips.find(c => ms >= c.wallclockStartMs && ms <= c.wallclockStartMs + c.durationMs) || null });
@@ -824,7 +1021,7 @@
     if (event.key === 'j' || event.key === 'J') { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }
     if (event.key === 'ArrowLeft') { wallclockMs = Math.max(0, wallclockMs - (event.shiftKey ? 1000 : 100)); seekAll(); }
     if (event.key === 'ArrowRight') { wallclockMs += event.shiftKey ? 1000 : 100; seekAll(); }
-    if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClip) deleteClip(selectedClip);
+    if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClips.length) { event.preventDefault(); deleteSelectedClips(); }
     if (event.key === '?') showKeyboardHelp = !showKeyboardHelp;
   }
 
@@ -855,8 +1052,8 @@
   function format(ms) { const d = new Date(Math.max(0, ms)); return d.toISOString().substring(11, 23); }
   function inferPerspective(path) { const parts = path.split('/').filter(Boolean); return parts.length > 1 ? parts[parts.length - 2] : 'Default'; }
   function clipBlockStyle(clip, ghost = false) {
-    const isDragged = dragState?.clipId === clip.clipId;
-    const start = isDragged && !ghost ? dragState.previewStartMs : clip.wallclockStartMs;
+    const isDragged = isClipDragging(clip);
+    const start = isDragged && !ghost ? dragPreviewStart(clip) : dragOriginalStart(clip);
     return `left:${msToLanePx(start)}px;width:${Math.max(36, msToLanePx(clip.durationMs || 1000))}px;`;
   }
   function markerStyle(m) { return `left:${msToPx(m.marker_ts_ms)}px;color:${markerColor(m)};`; }
@@ -1267,13 +1464,15 @@
             <button class="tbar-tool-btn" onclick={addRegion} title="Region (R)">
               <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="3" width="9" height="4" rx="1" stroke="#8f70ff" stroke-width="1.2" fill="rgba(143,112,255,.2)"/></svg>Region
             </button>
+            <button class="tbar-tool-btn {snapEnabled ? 'tbar-active' : ''}" onclick={() => { snapEnabled = !snapEnabled; persistPrefs(); }} title="Snap clip edges to playhead, markers, regions, and other clip edges">Snap</button>
+            <button class="tbar-tool-btn {linkedMoveEnabled ? 'tbar-active' : ''}" onclick={() => { linkedMoveEnabled = !linkedMoveEnabled; persistPrefs(); }} title="Move linked video/audio clips together">Link</button>
             <div class="tbar-sep"></div>
             <button class="tbar-tool-btn {showIngestPanel ? 'tbar-active' : ''}" onclick={() => { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }}>
               Jobs {pendingJobCount > 0 ? `(${pendingJobCount})` : ''}{failedJobCount > 0 ? ` ⚠${failedJobCount}` : ''}
             </button>
           </div>
           <div class="tbar-r">
-            <span class="tbar-hint">Drag ruler = scrub · Drag clip = align · M/R = add annotation · ? = help</span>
+            <span class="tbar-hint">Shift-click = multi-select · Shift-drag empty lane = marquee · Drag selected = move selection · Delete = remove selection</span>
           </div>
         </div>
 
@@ -1316,9 +1515,9 @@
                       <span class="track-label-sub muted">{row.perspectiveName}</span>
                     </div>
                     {#if row.kind === 'video'}
-                      <button class="toggle-btn {visibleTrackIds.includes(row.id) ? 'tog-v-on' : ''}" onclick={() => toggleTrack('video', row.id)} title="Show in grid">V</button>
+                      <button class="toggle-btn {hasId(visibleTrackIds, row.id) ? 'tog-v-on' : ''}" onclick={() => toggleTrack('video', row.id)} title="Show in grid">V</button>
                     {:else}
-                      <button class="toggle-btn {activeAudioIds.includes(row.id) ? 'tog-a-on' : ''}" onclick={() => toggleTrack('audio', row.id)} title="Enable audio">A</button>
+                      <button class="toggle-btn {hasId(activeAudioIds, row.id) ? 'tog-a-on' : ''}" onclick={() => toggleTrack('audio', row.id)} title="Enable audio">A</button>
                     {/if}
                   </div>
                 </div>
@@ -1329,6 +1528,7 @@
           <!-- Scrolling lanes -->
           <div class="lane-scroll" bind:this={timelineViewport}>
             <div class="lane-canvas" bind:this={timelineCanvas} style="width:{timelineWidthPx}px">
+              {#if marqueeState}<div class="marquee-box" style={marqueeStyle(marqueeState)}></div>{/if}
               <!-- Ruler -->
               <div class="ruler" onpointerdown={startPlayheadDrag}>
                 {#each tickMarks as tick}
@@ -1353,9 +1553,12 @@
                   </div>
                 {:else if row.type === 'collapsed'}
                   <div class="lane-track-row lane-collapsed">
-                    <div class="clip-lane" onpointerdown={startPlayheadDrag}>
+                    <div class="clip-lane" onpointerdown={startLanePointerDown}>
                       {#each row.clips as clip (clip.clipId)}
-                        <button class="clip-block {clip.kind} {clipStatus(clip)} clip-summary" class:clip-selected={selectedClipId === clip.clipId} title="{clip.displayName} · {clip.kind}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)} onclick={() => { selectedClipId = clip.clipId; persistPrefs(); }}>
+                        {#if isClipDragging(clip)}
+                          <div class="clip-block {clip.kind} clip-ghost clip-summary" style={clipBlockStyle(clip, true)}></div>
+                        {/if}
+                        <button data-clip-id={clip.clipId} class="clip-block {clip.kind} {clipStatus(clip)} clip-summary" class:clip-selected={isClipSelected(clip)} class:clip-dragging={isClipDragging(clip)} title="{clip.displayName} · {clip.kind}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)}>
                           {#if clip.kind === 'audio'}<span class="waveform">{#each waveBars(clip) as h}<i style="height:{h}%"></i>{/each}</span>
                           {:else}<span class="video-stripe"></span>{/if}
                         </button>
@@ -1364,18 +1567,19 @@
                   </div>
                 {:else}
                   <div class="lane-track-row lane-{row.kind}">
-                    <div class="clip-lane" onpointerdown={startPlayheadDrag}>
+                    <div class="clip-lane" onpointerdown={startLanePointerDown}>
                       {#each row.clips as clip (clip.clipId)}
-                        {#if dragState?.clipId === clip.clipId}
+                        {#if isClipDragging(clip)}
                           <div class="clip-block {clip.kind} clip-ghost" style={clipBlockStyle(clip, true)}><span class="clip-title">{clip.displayName}</span></div>
                         {/if}
-                        <button class="clip-block {clip.kind} {clipStatus(clip)}" class:clip-selected={selectedClipId === clip.clipId} class:clip-dragging={dragState?.clipId === clip.clipId} title="{clip.displayName || clip.trackName}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)} onclick={() => { selectedClipId = clip.clipId; persistPrefs(); activeInspectorTab = 'clip'; }}>
+                        <button data-clip-id={clip.clipId} class="clip-block {clip.kind} {clipStatus(clip)}" class:clip-selected={isClipSelected(clip)} class:clip-dragging={isClipDragging(clip)} class:clip-linked={clip.linkGroupId && linkedMoveEnabled} title="{clip.displayName || clip.trackName}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)}>
                           <span class="clip-title">{clip.displayName || clip.trackName}</span>
                           {#if clipStatus(clip) !== 'success'}<span class="clip-badge {clipStatus(clip)}">{statusText(clip)}</span>{/if}
+                          {#if clip.linkGroupId}<span class="clip-link-badge">🔗</span>{/if}
                           {#if clip.kind === 'audio'}<span class="waveform">{#each waveBars(clip) as h}<i style="height:{h}%"></i>{/each}</span>
                           {:else}<span class="video-stripe"></span>{/if}
                           <span class="clip-timecode">{format(clip.wallclockStartMs)} · {format(clip.durationMs)}</span>
-                          {#if isProjectOwner()}<span class="clip-del" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); deleteClip(clip); }}>×</span>{/if}
+                          {#if isProjectOwner()}<span class="clip-del" role="button" tabindex="0" onpointerdown={(e) => e.stopPropagation()} onclick={(e) => { e.stopPropagation(); deleteClip(clip); }}>×</span>{/if}
                         </button>
                       {/each}
                     </div>
@@ -1407,10 +1611,12 @@
                 <span class="clip-inspect-name">{selectedClip.displayName}</span>
               </div>
               <dl class="detail-list">
+                <dt>Selected</dt><dd>{selectedClips.length} clip{selectedClips.length === 1 ? '' : 's'}</dd>
                 <dt>Track</dt><dd>{selectedClip.perspectiveName} / {selectedClip.trackName}</dd>
                 <dt>Stream</dt><dd>#{selectedClip.streamIndex}</dd>
                 <dt>Start</dt><dd>{format(selectedClip.wallclockStartMs)}</dd>
                 <dt>Duration</dt><dd>{format(selectedClip.durationMs)}</dd>
+                <dt>A/V link</dt><dd>{selectedClip.linkGroupId ? 'Linked' : 'Detached'}</dd>
                 <dt>Status</dt>
                 <dd class="status-dd">
                   <span class="inline-status {clipStatus(selectedClip)}">{clipStatus(selectedClip)}</span>
@@ -1423,6 +1629,11 @@
 
             <div class="ins-section">
               <p class="ins-section-label">Timeline align {isProjectOwner() ? '' : '(owner only)'}</p>
+              {#if selectedClips.length > 1}
+                <p class="muted">Nudges and drags move all selected clips together.</p>
+              {:else if selectedClip.linkGroupId && linkedMoveEnabled}
+                <p class="muted">Linked A/V is enabled, so matching video/audio clips move together.</p>
+              {/if}
               <div class="nudge-grid">
                 <button class="nudge-btn" onclick={() => moveClip(selectedClip, -1000)} disabled={!isProjectOwner()}>−1s</button>
                 <button class="nudge-btn" onclick={() => moveClip(selectedClip, -100)} disabled={!isProjectOwner()}>−100ms</button>
@@ -1442,8 +1653,9 @@
             </div>
 
             <div class="ins-section ins-actions">
-              <button class="action-btn" onclick={renameSelectedClip} disabled={!isProjectOwner()}>Rename…</button>
-              <button class="action-btn action-danger" onclick={() => deleteClip(selectedClip)} disabled={!isProjectOwner()}>Delete clip</button>
+              <button class="action-btn" onclick={renameSelectedClip} disabled={!isProjectOwner() || selectedClips.length !== 1}>Rename…</button>
+              <button class="action-btn" onclick={detachSelectedClips} disabled={!isProjectOwner() || !selectedClips.some(c => c.linkGroupId)}>Detach A/V</button>
+              <button class="action-btn action-danger" onclick={deleteSelectedClips} disabled={!isProjectOwner()}>Delete {selectedClips.length > 1 ? 'selection' : 'clip'}</button>
             </div>
           {:else}
             <p class="muted padded">Select a clip in the timeline.</p>
@@ -1455,7 +1667,7 @@
             {#each audioClips as clip}
               <div class="mixer-entry">
                 <label class="mixer-check-row">
-                  <input type="checkbox" checked={activeAudioIds.includes(clip.trackId)} onchange={() => toggleTrack('audio', clip.trackId)} />
+                  <input type="checkbox" checked={hasId(activeAudioIds, clip.trackId)} onchange={() => toggleTrack('audio', clip.trackId)} />
                   <span class="mixer-name" title="{clip.perspectiveName} / {clip.trackName}">{clip.perspectiveName} / {clip.trackName}</span>
                 </label>
                 <div class="mixer-vol-row">
