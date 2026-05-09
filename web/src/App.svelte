@@ -132,8 +132,13 @@
   }
 
   async function setMyColor(color) {
-    me = await postJSON('/api/me/color', { color });
-    showColorPicker = false;
+    try {
+      error = '';
+      me = await postJSON('/api/me/color', { color });
+      showColorPicker = false;
+    } catch (e) {
+      setError(e.message || 'Could not update accent color', 4000);
+    }
   }
 
   async function loadProjects() { projects = await api('/api/projects'); }
@@ -1219,7 +1224,8 @@
     return parts.join(' · ');
   }
 
-  const ACCENT_COLORS = ['#ff6c70','#f6c85f','#33c899','#5d94ff','#b882ff','#ff9d5c','#60d8ff','#ff72b8'];
+  // Must match internal/auth.Palette; the backend rejects colors outside the accessible palette.
+  const ACCENT_COLORS = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#8F00FF'];
 </script>
 
 {#if !me}
