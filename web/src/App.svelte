@@ -97,6 +97,7 @@
     const timer = setInterval(syncPlayingMedia, 250);
     const poller = setInterval(() => {
       if (current && (statusCounts.queued > 0 || statusCounts.processing > 0)) refreshProject();
+      if (current && showIngestPanel && pendingJobCount > 0) refreshIngestJobs();
     }, 2000);
     boot();
     return () => {
@@ -196,6 +197,8 @@
         if (!presenceUsers.find(p => p.username === u.username)) presenceUsers = [...presenceUsers, u];
       } else if (msg.type === 'user.left') {
         presenceUsers = presenceUsers.filter(p => p.username !== msg.payload?.username);
+      } else if (msg.type === 'clip.ingest.progress') {
+        applyJobProgress(msg.payload || {});
       } else if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) {
         await refreshProject();
         if (msg.type?.startsWith('clip.') || msg.type?.startsWith('ingest.')) await refreshIngestJobs();
@@ -245,6 +248,29 @@
   async function refreshIngestJobs() {
     if (!current) return;
     ingestJobs = await api(`/api/projects/${current.id}/ingest-jobs`);
+  }
+
+  function applyJobProgress(payload) {
+    const jobId = Number(payload.jobId || payload.job_id || 0);
+    if (!jobId) return;
+    let found = false;
+    ingestJobs = ingestJobs.map((job) => {
+      if (Number(job.id) !== jobId) return job;
+      found = true;
+      return {
+        ...job,
+        state: 'PROCESSING',
+        stage: payload.stage || job.stage || 'transcoding',
+        progress_pct: Math.max(jobProgress(job), Number(payload.pct ?? job.progress_pct ?? 0)),
+        progress_time_ms: payload.timeMs ?? job.progress_time_ms ?? 0,
+        total_duration_ms: payload.totalDurationMs ?? job.total_duration_ms ?? 0,
+        ffmpeg_frame: payload.frame ?? job.ffmpeg_frame ?? 0,
+        ffmpeg_fps: payload.fps ?? job.ffmpeg_fps ?? 0,
+        ffmpeg_bitrate: payload.bitrate ?? job.ffmpeg_bitrate ?? '',
+        ffmpeg_speed: payload.speed ?? job.ffmpeg_speed ?? ''
+      };
+    });
+    if (!found) refreshIngestJobs();
   }
 
   async function retryClipIngest(clipId) {
@@ -793,6 +819,18 @@
   }
   function clipStatus(clip) { return String(clip.ingestStatus || (clip.hlsURL ? 'SUCCESS' : 'PENDING')).toLowerCase(); }
   function statusText(clip) { const s = clipStatus(clip); return s === 'success' ? '' : s === 'processing' ? 'encoding' : s === 'failed' ? 'failed' : 'queued'; }
+  function jobProgress(job) { return Math.max(0, Math.min(1, Number(job.progress_pct || 0))); }
+  function jobProgressPct(job) { return `${Math.round(jobProgress(job) * 100)}%`; }
+  function jobStage(job) { const state = String(job.state || 'job'); return job.stage || (state === 'PROCESSING' ? 'working' : state.toLowerCase()); }
+  function jobClipLabel(job) { return job.clip_name || `clip ${job.clip_id}`; }
+  function jobStats(job) {
+    const parts = [];
+    if (Number(job.progress_time_ms) > 0 && Number(job.total_duration_ms) > 0) parts.push(`${format(Number(job.progress_time_ms))}/${format(Number(job.total_duration_ms))}`);
+    if (Number(job.ffmpeg_fps) > 0) parts.push(`${Number(job.ffmpeg_fps).toFixed(1)} fps`);
+    if (job.ffmpeg_speed) parts.push(`${job.ffmpeg_speed}`);
+    if (job.ffmpeg_bitrate) parts.push(`${job.ffmpeg_bitrate}`);
+    return parts.join(' · ');
+  }
 
   const ACCENT_COLORS = ['#ff6c70','#f6c85f','#33c899','#5d94ff','#b882ff','#ff9d5c','#60d8ff','#ff72b8'];
 </script>
@@ -954,13 +992,27 @@
       <div class="job-scroll">
         {#each ingestJobs.slice(0, 60) as job}
           <div class="job-row">
-            <span class="job-badge {job.state === 'SUCCESS' ? 'jb-ok' : job.state === 'FAILED' ? 'jb-fail' : job.state === 'PROCESSING' ? 'jb-run' : 'jb-pend'}">{job.state}</span>
-            <span class="job-id">#{job.id}</span>
-            <span class="job-clip muted">clip {job.clip_id}</span>
-            {#if job.error}<span class="job-err" title={job.error}>⚠</span>{/if}
-            {#if job.state === 'FAILED'}
-              <button class="btn-sm btn-warn-sm" onclick={() => retryClipIngest(job.clip_id)}>Retry</button>
-            {/if}
+            <div class="job-main">
+              <div class="job-line">
+                <span class="job-badge {job.state === 'SUCCESS' ? 'jb-ok' : job.state === 'FAILED' ? 'jb-fail' : job.state === 'PROCESSING' ? 'jb-run' : 'jb-pend'}">{job.state}</span>
+                <span class="job-id">#{job.id}</span>
+                <span class="job-clip muted" title={jobClipLabel(job)}>{jobClipLabel(job)}</span>
+                {#if job.error}<span class="job-err" title={job.error}>⚠</span>{/if}
+                {#if job.state === 'FAILED'}
+                  <button class="btn-sm btn-warn-sm" onclick={() => retryClipIngest(job.clip_id)}>Retry</button>
+                {/if}
+              </div>
+              <div class="job-detail">
+                <span>{jobStage(job)}</span>
+                {#if job.state === 'PROCESSING' || jobProgress(job) > 0}
+                  <span class="job-pct">{jobProgressPct(job)}</span>
+                {/if}
+                {#if jobStats(job)}<span class="job-stats">{jobStats(job)}</span>{/if}
+              </div>
+              {#if job.state === 'PROCESSING' || jobProgress(job) > 0}
+                <div class="job-progress"><i style="width:{jobProgressPct(job)}"></i></div>
+              {/if}
+            </div>
           </div>
         {:else}
           <p class="muted padded">No jobs.</p>

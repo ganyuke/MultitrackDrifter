@@ -39,3 +39,20 @@ func TestStreamSummariesIncludeMultipleAudioStreams(t *testing.T) {
 		t.Fatalf("audio FPS metadata should be zero, got %d/%d", got[1].FPSNum, got[1].FPSDen)
 	}
 }
+
+func TestProgressFromStateParsesFFmpegProgressStats(t *testing.T) {
+	p, ok := progressFromState(map[string]string{
+		"frame":       "1200",
+		"fps":         "29.97",
+		"bitrate":     "1420.2kbits/s",
+		"out_time_us": "40000000",
+		"speed":       "1.25x",
+		"progress":    "continue",
+	})
+	if !ok {
+		t.Fatal("progressFromState returned ok=false")
+	}
+	if p.TimeMS != 40000 || p.Frame != 1200 || p.FPS != 29.97 || p.Bitrate != "1420.2kbits/s" || p.Speed != "1.25x" || p.Status != "continue" {
+		t.Fatalf("unexpected progress: %#v", p)
+	}
+}

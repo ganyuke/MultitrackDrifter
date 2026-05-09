@@ -193,6 +193,18 @@ WHERE id IN (SELECT id FROM ranked_active_jobs WHERE rn > 1);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_jobs_one_active_per_clip
 ON ingest_jobs(project_id, clip_id)
 WHERE state IN ('PENDING','PROCESSING');
+`}, {5, `
+ALTER TABLE ingest_jobs ADD COLUMN stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN progress_pct REAL NOT NULL DEFAULT 0;
+ALTER TABLE ingest_jobs ADD COLUMN progress_time_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ingest_jobs ADD COLUMN total_duration_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_frame INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_fps REAL NOT NULL DEFAULT 0;
+ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_bitrate TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN ffmpeg_speed TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN last_log TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+UPDATE ingest_jobs SET updated_at=COALESCE(NULLIF(finished_at,''), NULLIF(started_at,''), created_at, datetime('now')) WHERE updated_at='';
 `}}
 
 func Migrate(ctx context.Context, db *sql.DB) error {

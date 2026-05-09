@@ -761,7 +761,15 @@ func (s *Server) listIngestJobs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows := s.queryRows(r.Context(), `SELECT id, clip_id, state, error, created_at, started_at, finished_at FROM ingest_jobs WHERE project_id=? ORDER BY id DESC`, projectID)
+	rows := s.queryRows(r.Context(), `
+SELECT j.id, j.clip_id, COALESCE(c.display_name, '') AS clip_name, j.state, j.stage, j.error,
+       j.progress_pct, j.progress_time_ms, j.total_duration_ms,
+       j.ffmpeg_frame, j.ffmpeg_fps, j.ffmpeg_bitrate, j.ffmpeg_speed,
+       j.created_at, j.started_at, j.finished_at, j.updated_at
+FROM ingest_jobs j
+LEFT JOIN clips c ON c.id=j.clip_id
+WHERE j.project_id=?
+ORDER BY CASE j.state WHEN 'PROCESSING' THEN 0 WHEN 'PENDING' THEN 1 WHEN 'FAILED' THEN 2 ELSE 3 END, j.id DESC`, projectID)
 	writeJSON(w, 200, rows)
 }
 

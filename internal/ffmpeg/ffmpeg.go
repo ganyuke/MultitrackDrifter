@@ -71,7 +71,12 @@ type TranscodeOptions struct {
 }
 
 type Progress struct {
-	TimeMS int64
+	TimeMS  int64
+	Frame   int64
+	FPS     float64
+	Bitrate string
+	Speed   string
+	Status  string
 }
 
 func (r Runner) Probe(ctx context.Context, input string) (Probe, error) {
@@ -209,15 +214,21 @@ func scanFFmpegProgress(ctx context.Context, r io.Reader, captured *bytes.Buffer
 	s := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
 	s.Buffer(buf, 1024*1024)
+	state := map[string]string{}
 	for s.Scan() {
 		line := s.Text()
 		if captured.Len() < 256*1024 {
 			_, _ = captured.WriteString(line)
 			_ = captured.WriteByte('\n')
 		}
-		if cb != nil {
-			if ms, ok := progressTimeMS(line); ok {
-				cb(Progress{TimeMS: ms})
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		state[key] = value
+		if cb != nil && (key == "progress" || isProgressTimeKey(key)) {
+			if p, ok := progressFromState(state); ok {
+				cb(p)
 			}
 		}
 	}
@@ -225,6 +236,37 @@ func scanFFmpegProgress(ctx context.Context, r io.Reader, captured *bytes.Buffer
 		return err
 	}
 	return nil
+}
+
+func isProgressTimeKey(key string) bool {
+	switch key {
+	case "out_time_us", "out_time_ms", "out_time":
+		return true
+	default:
+		return false
+	}
+}
+
+func progressFromState(state map[string]string) (Progress, bool) {
+	var p Progress
+	if us, err := strconv.ParseInt(firstNonEmpty(state["out_time_us"], state["out_time_ms"]), 10, 64); err == nil && us >= 0 {
+		// FFmpeg historically names out_time_ms as milliseconds, but it is microseconds.
+		p.TimeMS = us / 1000
+	} else if ms := parseClockMS(state["out_time"]); ms >= 0 {
+		p.TimeMS = ms
+	} else {
+		return Progress{}, false
+	}
+	if frame, err := strconv.ParseInt(state["frame"], 10, 64); err == nil && frame >= 0 {
+		p.Frame = frame
+	}
+	if fps, err := strconv.ParseFloat(state["fps"], 64); err == nil && fps >= 0 {
+		p.FPS = fps
+	}
+	p.Bitrate = strings.TrimSpace(state["bitrate"])
+	p.Speed = strings.TrimSpace(state["speed"])
+	p.Status = strings.TrimSpace(state["progress"])
+	return p, true
 }
 
 func progressTimeMS(line string) (int64, bool) {

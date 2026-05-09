@@ -152,7 +152,9 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 
 .ingest-float { top:calc(var(--topbar-h) + 4px); right:260px; width:340px; max-height:min(480px,calc(100vh - 48px)); display:grid; grid-template-rows:28px minmax(0,1fr); }
 .job-scroll { overflow-y:auto; }
-.job-row { display:flex; align-items:center; gap:6px; min-height:28px; padding:3px 8px; border-bottom:1px solid var(--line); font-size:10px; flex-wrap:nowrap; overflow:hidden; }
+.job-row { display:flex; align-items:center; gap:6px; min-height:28px; padding:5px 8px; border-bottom:1px solid var(--line); font-size:10px; flex-wrap:nowrap; overflow:hidden; }
+.job-main { flex:1; min-width:0; display:grid; gap:3px; }
+.job-line { display:flex; align-items:center; gap:6px; min-width:0; }
 .job-badge { padding:1px 5px; font-size:9px; font-weight:700; letter-spacing:.04em; flex-shrink:0; }
 .jb-ok   { background:#0c2018; color:var(--green); border:1px solid #1a4030; }
 .jb-fail { background:var(--red-dk); color:#ffb0b0; border:1px solid #5a2028; }
@@ -161,6 +163,11 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .job-id  { font-family:ui-monospace,monospace; color:var(--muted2); flex-shrink:0; }
 .job-clip { flex:1; color:var(--muted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .job-err { color:var(--yellow); flex-shrink:0; }
+.job-detail { display:flex; gap:6px; align-items:center; min-width:0; color:var(--muted2); font-size:9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.job-pct { color:var(--text); font-family:ui-monospace,monospace; }
+.job-stats { overflow:hidden; text-overflow:ellipsis; }
+.job-progress { height:3px; border-radius:999px; overflow:hidden; background:rgba(255,255,255,.08); }
+.job-progress i { display:block; height:100%; border-radius:999px; background:rgba(93,148,255,.75); transition:width .18s ease; }
 
 .ann-float { top:calc(var(--topbar-h) + 4px); right:260px; width:min(360px,calc(100vw - 270px)); max-height:calc(100vh - 48px); overflow-y:auto; padding-bottom:8px; border-color:var(--ann,var(--line2)); }
 .ann-float > label { padding:4px 8px 0; }
