@@ -9,31 +9,57 @@
   let error = '';
   let importError = '';
   let errorTimer = null;
+
   let projects = [];
   let current = null;
-  let manifest = { clips: [] };
-  let markers = [];
-  let regions = [];
-  let sources = [];
-  let sourcePrefix = '';
-  let importProbe = null;
-  let importPerspective = '';
-  let importStreams = [];
   let newProjectName = 'Local review';
+  let showProjectPicker = false;
+  let editingProjectName = '';
+  let editingProjectDesc = '';
+  let showProjectEdit = false;
+
+  let manifest = { clips: [] };
   let wallclockMs = 0;
   let playing = false;
   let started = false;
+  let playbackToken = 0;
+  let previousTargetSignature = '';
+
   let gridPreset = '2x2';
   let visibleTrackIds = [];
   let activeAudioIds = [];
   let softNudges = {};
   let volumes = {};
   let selectedClipId = null;
+  let perspectiveOrder = [];
+  let trackOrder = [];
+  let collapsedPerspectiveIds = [];
+  let hiddenPerspectiveIds = [];
+  let rememberedPerspectiveViewIds = {};
+  let rememberedPerspectiveAudioIds = {};
+
+  let markers = [];
+  let regions = [];
+  let annotationEditor = null;
+  let annotationSaved = '';
+
+  let sources = [];
+  let sourcePrefix = '';
+  let importProbe = null;
+  let importPerspective = '';
+  let importStreams = [];
+
+  let ingestJobs = [];
+  let showIngestPanel = false;
+
+  let presenceUsers = [];
+  let ws;
+  let wsConnected = false;
+
   let timelineViewport;
   let timelineCanvas;
   let dragState = null;
-  let ws;
-  const TRACK_HEADER_PX = 196;
+
   let mediaRefs = new Map();
   let cleanups = new Map();
   let attachedUrls = new Map();
@@ -42,17 +68,12 @@
   let trackCleanups = new Map();
   let trackAttachedUrls = new Map();
   let trackAttachedNodes = new Map();
-  let annotationEditor = null;
-  let annotationSaved = '';
-  let playbackToken = 0;
-  let showProjectPicker = false;
-  let perspectiveOrder = [];
-  let trackOrder = [];
-  let collapsedPerspectiveIds = [];
-  let hiddenPerspectiveIds = [];
-  let rememberedPerspectiveViewIds = {};
-  let rememberedPerspectiveAudioIds = {};
-  let previousTargetSignature = '';
+
+  let showColorPicker = false;
+  let showKeyboardHelp = false;
+  let activeInspectorTab = 'clip';
+  let renameTarget = null;
+  let renameValue = '';
 
   $: allClips = manifest.clips || [];
   $: videoClips = allClips.filter(c => c.kind === 'video');
@@ -68,6 +89,8 @@
   $: tickMarks = makeTicks(timelineEndMs);
   $: activeAudioClips = audioClips.filter(c => activeAudioIds.includes(c.trackId));
   $: statusCounts = countStatuses(allClips);
+  $: pendingJobCount = ingestJobs.filter(j => j.state === 'PENDING' || j.state === 'PROCESSING').length;
+  $: failedJobCount = ingestJobs.filter(j => j.state === 'FAILED').length;
 
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -95,15 +118,28 @@
 
   async function logout() {
     await postJSON('/api/logout', {});
-    me = null; current = null; projects = []; disconnectMedia();
+    me = null; current = null; projects = []; disconnectMedia(); presenceUsers = [];
+  }
+
+  async function setMyColor(color) {
+    me = await postJSON('/api/me/color', { color });
+    showColorPicker = false;
   }
 
   async function loadProjects() { projects = await api('/api/projects'); }
 
   async function createProject() {
-    const p = await postJSON('/api/projects', { name: newProjectName, description: 'Local source/local HLS POC' });
+    const p = await postJSON('/api/projects', { name: newProjectName, description: '' });
     await loadProjects();
     await openProject(p.id);
+  }
+
+  async function saveProjectEdit() {
+    if (!current) return;
+    await patchJSON(`/api/projects/${current.id}`, { name: editingProjectName, description: editingProjectDesc });
+    current = { ...current, name: editingProjectName, description: editingProjectDesc };
+    showProjectEdit = false;
+    await loadProjects();
   }
 
   async function openProject(id) {
@@ -128,6 +164,7 @@
     selectedClipId = prefs.selectedClipId || null;
     connectWS(id);
     await browseSources('');
+    await refreshIngestJobs();
     await tick();
     attachAll();
   }
@@ -148,9 +185,21 @@
     if (ws) ws.close();
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws/projects/${id}`);
+    ws.onopen = () => { wsConnected = true; };
+    ws.onclose = () => { wsConnected = false; };
     ws.onmessage = async (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) await refreshProject();
+      if (msg.type === 'presence.snapshot') {
+        presenceUsers = msg.payload?.users || [];
+      } else if (msg.type === 'user.joined') {
+        const u = msg.payload;
+        if (!presenceUsers.find(p => p.username === u.username)) presenceUsers = [...presenceUsers, u];
+      } else if (msg.type === 'user.left') {
+        presenceUsers = presenceUsers.filter(p => p.username !== msg.payload?.username);
+      } else if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) {
+        await refreshProject();
+        if (msg.type?.startsWith('clip.') || msg.type?.startsWith('ingest.')) await refreshIngestJobs();
+      }
     };
   }
 
@@ -168,45 +217,90 @@
 
   async function inspectSource(path) {
     importError = '';
-    error = '';
     importProbe = await api(`/api/projects/${current.id}/sources/probe?path=${encodeURIComponent(path)}`);
     importPerspective = inferPerspective(path);
     importStreams = (importProbe.streams || []).map((stream) => ({
-      ...stream,
-      selected: true,
+      ...stream, selected: true,
       track: `${importPerspective} / ${stream.label || (stream.kind === 'audio' ? 'Audio' : 'Video')}`,
       displayName: `${path.split('/').pop()} - ${stream.label || stream.kind}`
     }));
   }
 
   async function addSelectedStreams() {
-    const streams = importStreams.filter(s => s.selected).map(s => ({
-      streamIndex: s.index,
-      kind: s.kind,
-      track: s.track.trim(),
-      displayName: s.displayName.trim(),
-      label: s.label
-    }));
-    if (!streams.length) { importError = 'Select at least one video or audio stream.'; return; }
+    const streams = importStreams.filter(s => s.selected).map(s => ({ streamIndex: s.index, kind: s.kind, track: s.track.trim(), displayName: s.displayName.trim(), label: s.label }));
+    if (!streams.length) { importError = 'Select at least one stream.'; return; }
     await postJSON(`/api/projects/${current.id}/assets`, { sourcePath: importProbe.sourcePath, perspective: importPerspective, wallclockStartMs: wallclockMs, streams });
-    importProbe = null;
-    importStreams = [];
-    importError = '';
+    importProbe = null; importStreams = []; importError = '';
     await refreshProject();
-    setTimeout(refreshProject, 1200);
+    await refreshIngestJobs();
+    setTimeout(() => { refreshProject(); refreshIngestJobs(); }, 1200);
   }
 
   async function ingest() {
     await postJSON(`/api/projects/${current.id}/ingest`, {});
+    await refreshIngestJobs();
     setTimeout(refreshProject, 1200);
   }
 
-  async function addMarker() { await postJSON(`/api/projects/${current.id}/markers`, { tsMs: wallclockMs, label: 'Funny moment', note: '' }); }
-  async function addRegion() { await postJSON(`/api/projects/${current.id}/regions`, { startMs: wallclockMs, endMs: wallclockMs + 5000, label: 'Clip candidate', note: '' }); }
+  async function refreshIngestJobs() {
+    if (!current) return;
+    ingestJobs = await api(`/api/projects/${current.id}/ingest-jobs`);
+  }
+
+  async function retryClipIngest(clipId) {
+    if (!current) return;
+    await postJSON(`/api/projects/${current.id}/clips/${clipId}/ingest`, {});
+    await refreshProject();
+    await refreshIngestJobs();
+  }
+
+  async function addMarker() { await postJSON(`/api/projects/${current.id}/markers`, { tsMs: wallclockMs, label: 'Marker', note: '' }); }
+  async function addRegion() { await postJSON(`/api/projects/${current.id}/regions`, { startMs: wallclockMs, endMs: wallclockMs + 5000, label: 'Region', note: '' }); }
+
   async function deleteMarker(id) {
-    const marker = markers.find(m => String(m.id) === String(id));
-    if (marker && !canEditAnnotation(marker)) { annotationSaved = readOnlyAnnotationMessage(); return; }
+    const m = markers.find(m => String(m.id) === String(id));
+    if (m && !canEditAnnotation(m)) return;
     await del(`/api/projects/${current.id}/markers/${id}`);
+  }
+
+  async function deleteRegion(id) {
+    const r = regions.find(r => String(r.id) === String(id));
+    if (r && !canEditAnnotation(r)) return;
+    await del(`/api/projects/${current.id}/regions/${id}`);
+  }
+
+  function openAnnotationEditor(type, item, event) {
+    event?.preventDefault(); event?.stopPropagation();
+    annotationSaved = '';
+    if (type === 'marker') {
+      annotationEditor = { type, id: item.id, label: item.label || '', note: item.note || '', tsMs: Number(item.marker_ts_ms || 0), color: markerColor(item), author: annotationAuthor(item) };
+    } else {
+      annotationEditor = { type, id: item.id, label: item.label || '', note: item.note || '', startMs: Number(item.region_start_ms || 0), endMs: Number(item.region_end_ms || 0), color: regionColor(item), author: annotationAuthor(item) };
+    }
+  }
+
+  async function saveAnnotationEditor() {
+    if (!annotationEditor || !annotationEditorCanEdit()) { annotationSaved = readOnlyAnnotationMessage(); return; }
+    annotationSaved = 'Saving…';
+    if (annotationEditor.type === 'marker') {
+      await patchJSON(`/api/projects/${current.id}/markers/${annotationEditor.id}`, { tsMs: Number(annotationEditor.tsMs || 0), label: annotationEditor.label, note: annotationEditor.note });
+    } else {
+      await patchJSON(`/api/projects/${current.id}/regions/${annotationEditor.id}`, { startMs: Number(annotationEditor.startMs || 0), endMs: Number(annotationEditor.endMs || 0), label: annotationEditor.label, note: annotationEditor.note });
+    }
+    annotationSaved = 'Saved';
+    await refreshProject();
+  }
+
+  function startRename(type, id, name) { renameTarget = { type, id }; renameValue = name; }
+
+  async function commitRename() {
+    if (!renameTarget || !current || !renameValue.trim()) { renameTarget = null; return; }
+    const name = renameValue.trim();
+    if (renameTarget.type === 'perspective') {
+      await patchJSON(`/api/projects/${current.id}/perspectives/${renameTarget.id}`, { name });
+    }
+    renameTarget = null;
+    await refreshProject();
   }
 
   async function moveClipTo(clip, startMs) {
@@ -216,9 +310,14 @@
 
   async function moveClip(clip, delta) { await moveClipTo(clip, clip.wallclockStartMs + delta); }
 
+  function setSoftNudge(clipId, ms) {
+    softNudges = { ...softNudges, [clipId]: Number(ms) };
+    persistPrefs();
+    seekAll();
+  }
+
   async function renameSelectedClip() {
-    if (!selectedClip) return;
-    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
+    if (!selectedClip || !isProjectOwner()) return;
     const name = prompt('Clip name', selectedClip.displayName || '');
     if (name === null) return;
     await patchJSON(`/api/projects/${current.id}/clips/${selectedClip.clipId}`, { displayName: name });
@@ -226,10 +325,8 @@
   }
 
   async function deleteClip(clip = selectedClip) {
-    if (!clip) return;
-    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
-    const label = clip.displayName || 'clip';
-    if (!confirm(`Remove ${label} from this project timeline? Source files and generated review media stay on disk.`)) return;
+    if (!clip || !isProjectOwner()) return;
+    if (!confirm(`Remove "${clip.displayName || 'clip'}" from this project timeline?`)) return;
     await del(`/api/projects/${current.id}/clips/${clip.clipId || clip.id}`);
     if (selectedClipId === (clip.clipId || clip.id)) selectedClipId = null;
     await refreshProject();
@@ -241,145 +338,67 @@
   }
 
   function disconnectMedia() {
-    for (const cleanup of cleanups.values()) cleanup();
-    for (const cleanup of trackCleanups.values()) cleanup();
-    cleanups.clear();
-    attachedUrls.clear();
-    attachedNodes.clear();
-    mediaRefs.clear();
-    trackCleanups.clear();
-    trackAttachedUrls.clear();
-    trackAttachedNodes.clear();
-    trackMediaRefs.clear();
+    for (const c of cleanups.values()) c();
+    for (const c of trackCleanups.values()) c();
+    cleanups.clear(); attachedUrls.clear(); attachedNodes.clear(); mediaRefs.clear();
+    trackCleanups.clear(); trackAttachedUrls.clear(); trackAttachedNodes.clear(); trackMediaRefs.clear();
   }
 
-  function cleanupClipMedia(clipId) {
-    const cleanup = cleanups.get(clipId);
-    if (cleanup) cleanup();
-    cleanups.delete(clipId);
-    attachedUrls.delete(clipId);
-    attachedNodes.delete(clipId);
-  }
-
-  function cleanupTrackMedia(trackId) {
-    const cleanup = trackCleanups.get(trackId);
-    if (cleanup) cleanup();
-    trackCleanups.delete(trackId);
-    trackAttachedUrls.delete(trackId);
-    trackAttachedNodes.delete(trackId);
-  }
+  function cleanupClipMedia(clipId) { const c = cleanups.get(clipId); if (c) c(); cleanups.delete(clipId); attachedUrls.delete(clipId); attachedNodes.delete(clipId); }
+  function cleanupTrackMedia(trackId) { const c = trackCleanups.get(trackId); if (c) c(); trackCleanups.delete(trackId); trackAttachedUrls.delete(trackId); trackAttachedNodes.delete(trackId); }
 
   function setMedia(node, key) {
-    if (node) {
-      mediaRefs.set(key, node);
-      attachedUrls.delete(key);
-      attachedNodes.delete(key);
-    }
+    if (node) { mediaRefs.set(key, node); attachedUrls.delete(key); attachedNodes.delete(key); }
     return {
-      update: (nextKey) => {
-        if (nextKey === key) return;
-        mediaRefs.delete(key);
-        cleanupClipMedia(key);
-        key = nextKey;
-        mediaRefs.set(key, node);
-      },
-      destroy: () => {
-        mediaRefs.delete(key);
-        cleanupClipMedia(key);
-      }
+      update: (nk) => { if (nk === key) return; mediaRefs.delete(key); cleanupClipMedia(key); key = nk; mediaRefs.set(key, node); },
+      destroy: () => { mediaRefs.delete(key); cleanupClipMedia(key); }
     };
   }
 
   function setTrackMedia(node, trackId) {
-    if (node) {
-      trackMediaRefs.set(trackId, node);
-      trackAttachedUrls.delete(trackId);
-      trackAttachedNodes.delete(trackId);
-    }
+    if (node) { trackMediaRefs.set(trackId, node); trackAttachedUrls.delete(trackId); trackAttachedNodes.delete(trackId); }
     return {
-      update: (nextTrackId) => {
-        if (nextTrackId === trackId) return;
-        trackMediaRefs.delete(trackId);
-        cleanupTrackMedia(trackId);
-        trackId = nextTrackId;
-        trackMediaRefs.set(trackId, node);
-      },
-      destroy: () => {
-        trackMediaRefs.delete(trackId);
-        cleanupTrackMedia(trackId);
-      }
+      update: (nt) => { if (nt === trackId) return; trackMediaRefs.delete(trackId); cleanupTrackMedia(trackId); trackId = nt; trackMediaRefs.set(trackId, node); },
+      destroy: () => { trackMediaRefs.delete(trackId); cleanupTrackMedia(trackId); }
     };
   }
 
-  function attachAll() {
-    attachAudioClips();
-    attachVideoCells();
-  }
+  function attachAll() { attachAudioClips(); attachVideoCells(); }
 
   function attachAudioClips() {
-    const liveAudio = new Set(audioClips.map(c => c.clipId));
-    for (const [clipId, cleanup] of cleanups.entries()) {
-      if (!liveAudio.has(clipId)) {
-        cleanup();
-        cleanups.delete(clipId);
-        attachedUrls.delete(clipId);
-        attachedNodes.delete(clipId);
-      }
-    }
+    const live = new Set(audioClips.map(c => c.clipId));
+    for (const [id, c] of cleanups.entries()) { if (!live.has(id)) { c(); cleanups.delete(id); attachedUrls.delete(id); attachedNodes.delete(id); } }
     for (const clip of audioClips) {
       const node = mediaRefs.get(clip.clipId);
       if (!node || !clip.hlsURL) continue;
       node.muted = !activeAudioIds.includes(clip.trackId);
       node.volume = Number(volumes[clip.clipId] ?? 0.85);
       if (attachedUrls.get(clip.clipId) === clip.hlsURL && attachedNodes.get(clip.clipId) === node) continue;
-      const existing = cleanups.get(clip.clipId);
-      if (existing) existing();
+      const ex = cleanups.get(clip.clipId); if (ex) ex();
       cleanups.set(clip.clipId, attachHLS(node, clip.hlsURL));
-      attachedUrls.set(clip.clipId, clip.hlsURL);
-      attachedNodes.set(clip.clipId, node);
+      attachedUrls.set(clip.clipId, clip.hlsURL); attachedNodes.set(clip.clipId, node);
     }
   }
 
   function attachVideoCells() {
-    const liveTracks = new Set(monitorCells.map(c => c.trackId));
-    for (const [trackId, cleanup] of trackCleanups.entries()) {
-      if (!liveTracks.has(trackId)) {
-        cleanup();
-        trackCleanups.delete(trackId);
-        trackAttachedUrls.delete(trackId);
-        trackAttachedNodes.delete(trackId);
-      }
-    }
+    const live = new Set(monitorCells.map(c => c.trackId));
+    for (const [id, c] of trackCleanups.entries()) { if (!live.has(id)) { c(); trackCleanups.delete(id); trackAttachedUrls.delete(id); trackAttachedNodes.delete(id); } }
     for (const cell of monitorCells) {
       const node = trackMediaRefs.get(cell.trackId);
       if (!node) continue;
       const clip = cell.activeClip;
-      if (!clip || !clip.hlsURL || !isClipPlaybackEnabled(clip)) {
-        node.pause();
-        node.dataset.activeClipId = '';
-        continue;
-      }
-      node.muted = true;
-      node.dataset.activeClipId = String(clip.clipId);
+      if (!clip || !clip.hlsURL || !isClipPlaybackEnabled(clip)) { node.pause(); node.dataset.activeClipId = ''; continue; }
+      node.muted = true; node.dataset.activeClipId = String(clip.clipId);
       if (trackAttachedUrls.get(cell.trackId) === clip.hlsURL && trackAttachedNodes.get(cell.trackId) === node) continue;
-      const existing = trackCleanups.get(cell.trackId);
-      if (existing) existing();
+      const ex = trackCleanups.get(cell.trackId); if (ex) ex();
       resetMediaElement(node);
       trackCleanups.set(cell.trackId, attachHLS(node, clip.hlsURL));
-      trackAttachedUrls.set(cell.trackId, clip.hlsURL);
-      trackAttachedNodes.set(cell.trackId, node);
+      trackAttachedUrls.set(cell.trackId, clip.hlsURL); trackAttachedNodes.set(cell.trackId, node);
     }
   }
 
-  function mediaNodeForClip(clip) {
-    return clip.kind === 'video' ? trackMediaRefs.get(clip.trackId) : mediaRefs.get(clip.clipId);
-  }
-
-  function resetMediaElement(node) {
-    if (!node) return;
-    try { node.pause(); } catch (_) {}
-    try { node.removeAttribute('src'); node.load(); } catch (_) {}
-  }
+  function mediaNodeForClip(clip) { return clip.kind === 'video' ? trackMediaRefs.get(clip.trackId) : mediaRefs.get(clip.clipId); }
+  function resetMediaElement(node) { if (!node) return; try { node.pause(); } catch (_) {} try { node.removeAttribute('src'); node.load(); } catch (_) {} }
 
   function setError(msg, ms = 5000) {
     error = msg;
@@ -389,16 +408,12 @@
 
   function seekNode(node, seconds) {
     if (!node || !Number.isFinite(seconds)) return;
-    const apply = () => {
-      try { node.currentTime = Math.max(0, seconds); } catch (_) {}
-    };
+    const apply = () => { try { node.currentTime = Math.max(0, seconds); } catch (_) {} };
     if (node.readyState > 0) apply();
     else node.addEventListener('loadedmetadata', apply, { once: true });
   }
 
-  function isPlaybackTargetNow(clip) {
-    return playbackTargets().some(target => target.clipId === clip.clipId);
-  }
+  function isPlaybackTargetNow(clip) { return playbackTargets().some(t => t.clipId === clip.clipId); }
 
   function queueReadyPlay(node, clip, token) {
     const retry = () => {
@@ -415,22 +430,17 @@
   async function safePlay(node, clip, token = playbackToken) {
     if (!node || !clip || !isClipPlaybackEnabled(clip)) return;
     if (node.readyState < 2) queueReadyPlay(node, clip, token);
-    try {
-      await node.play();
-    } catch (e) {
-      const message = e?.message || '';
-      if (e?.name === 'AbortError' || /abort|interrupted|removed|detached/i.test(message)) return;
+    try { await node.play(); } catch (e) {
+      const msg = e?.message || '';
+      if (e?.name === 'AbortError' || /abort|interrupted|removed|detached/i.test(msg)) return;
       queueReadyPlay(node, clip, token);
-      if (token === playbackToken && isClipPlaybackEnabled(clip) && node.readyState > 0) setError(`Playback blocked for ${clip.displayName || clip.trackName}: ${message}`);
+      if (token === playbackToken && isClipPlaybackEnabled(clip) && node.readyState > 0) setError(`Playback blocked for ${clip.displayName || clip.trackName}: ${msg}`);
     }
   }
 
   async function startSession() {
-    started = true;
-    await tick();
-    attachAll();
-    seekAll();
-    playing = true;
+    started = true; await tick();
+    attachAll(); seekAll(); playing = true;
     await playActiveMedia();
   }
 
@@ -455,10 +465,7 @@
   }
 
   async function togglePlay() {
-    if (!started) {
-      await startSession();
-      return;
-    }
+    if (!started) { await startSession(); return; }
     playbackToken += 1;
     playing = !playing;
     if (playing) await playActiveMedia();
@@ -469,8 +476,7 @@
     const token = playbackToken;
     await tick();
     if (token !== playbackToken) return;
-    attachAll();
-    pauseInactiveMedia();
+    attachAll(); pauseInactiveMedia();
     for (const clip of playbackTargets()) {
       if (token !== playbackToken || !isClipPlaybackEnabled(clip)) continue;
       const node = mediaNodeForClip(clip);
@@ -483,26 +489,14 @@
     }
   }
 
-  function pauseAllMedia() {
-    playbackToken += 1;
-    for (const node of mediaRefs.values()) node.pause();
-    for (const node of trackMediaRefs.values()) node.pause();
-  }
+  function pauseAllMedia() { playbackToken += 1; for (const n of mediaRefs.values()) n.pause(); for (const n of trackMediaRefs.values()) n.pause(); }
 
   function pauseInactiveMedia() {
     const targets = playbackTargets();
-    const targetAudioIds = new Set(targets.filter(c => c.kind === 'audio').map(c => c.clipId));
-    const targetVideoTrackIds = new Set(targets.filter(c => c.kind === 'video').map(c => c.trackId));
-    for (const clip of audioClips) {
-      if (targetAudioIds.has(clip.clipId)) continue;
-      const node = mediaRefs.get(clip.clipId);
-      if (!node) continue;
-      node.pause();
-      node.muted = true;
-    }
-    for (const [trackId, node] of trackMediaRefs.entries()) {
-      if (!targetVideoTrackIds.has(trackId)) node.pause();
-    }
+    const tAudio = new Set(targets.filter(c => c.kind === 'audio').map(c => c.clipId));
+    const tVideo = new Set(targets.filter(c => c.kind === 'video').map(c => c.trackId));
+    for (const clip of audioClips) { if (tAudio.has(clip.clipId)) continue; const n = mediaRefs.get(clip.clipId); if (n) { n.pause(); n.muted = true; } }
+    for (const [id, n] of trackMediaRefs.entries()) { if (!tVideo.has(id)) n.pause(); }
   }
 
   function playbackTargets() {
@@ -519,32 +513,18 @@
     const list = listName === 'video' ? visibleTrackIds : activeAudioIds;
     const disabling = list.includes(id);
     const next = disabling ? list.filter(v => v !== id) : [...list, id];
-    if (listName === 'video') visibleTrackIds = next;
-    else activeAudioIds = next;
+    if (listName === 'video') visibleTrackIds = next; else activeAudioIds = next;
     if (disabling) disableTrackMedia(id);
     persistPrefs();
-    await tick();
-    attachAll();
-    seekAll();
+    await tick(); attachAll(); seekAll();
     if (playing) await playActiveMedia();
   }
 
-  function disableTrackMedia(trackId) {
-    for (const clip of allClips.filter(c => c.trackId === trackId)) disableClipMedia(clip.clipId);
-  }
-
-  function disableClipMedia(clipId) {
-    const clip = allClips.find(c => c.clipId === clipId);
-    const node = clip ? mediaNodeForClip(clip) : mediaRefs.get(clipId);
-    if (!node) return;
-    node.pause();
-    if (!clip || clip.kind === 'audio') node.muted = true;
-  }
+  function disableTrackMedia(trackId) { for (const clip of allClips.filter(c => c.trackId === trackId)) { const n = mediaNodeForClip(clip); if (n) { n.pause(); if (clip.kind === 'audio') n.muted = true; } } }
 
   function setVolume(clip, value) {
     volumes = { ...volumes, [clip.clipId]: Number(value) };
-    const node = mediaRefs.get(clip.clipId);
-    if (node) node.volume = Number(value);
+    const n = mediaRefs.get(clip.clipId); if (n) n.volume = Number(value);
     persistPrefs();
   }
 
@@ -553,56 +533,25 @@
     event.preventDefault();
     event.currentTarget?.setPointerCapture?.(event.pointerId);
     document.body.classList.add('dragging-timeline');
-    setWallclockFromClient(event.clientX);
-    seekAll();
+    setWallclockFromClient(event.clientX); seekAll();
     const move = (ev) => { ev.preventDefault(); setWallclockFromClient(ev.clientX); seekAll(); };
-    const up = () => {
-      document.body.classList.remove('dragging-timeline');
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    const up = () => { document.body.classList.remove('dragging-timeline'); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
 
   function startClipDrag(event, clip) {
-    selectedClipId = clip.clipId;
-    persistPrefs();
-    if (!isProjectOwner()) {
-      setError(projectOwnerMessage());
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
+    selectedClipId = clip.clipId; persistPrefs();
+    if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
+    event.preventDefault(); event.stopPropagation();
     event.currentTarget?.setPointerCapture?.(event.pointerId);
     document.body.classList.add('dragging-timeline');
-    dragState = {
-      clipId: clip.clipId,
-      originalStartMs: clip.wallclockStartMs,
-      previewStartMs: clip.wallclockStartMs,
-      pointerStartMs: clientToTimelineMs(event.clientX)
-    };
-    const move = (ev) => {
-      const delta = clientToTimelineMs(ev.clientX) - dragState.pointerStartMs;
-      dragState = { ...dragState, previewStartMs: Math.max(0, snapMs(dragState.originalStartMs + delta, 50)) };
-      wallclockMs = dragState.previewStartMs;
-    };
-    const up = async () => {
-      document.body.classList.remove('dragging-timeline');
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      const finished = dragState;
-      dragState = null;
-      if (finished && Math.abs(finished.previewStartMs - finished.originalStartMs) >= 1) {
-        await moveClipTo(clip, finished.previewStartMs);
-      }
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    dragState = { clipId: clip.clipId, originalStartMs: clip.wallclockStartMs, previewStartMs: clip.wallclockStartMs, pointerStartMs: clientToTimelineMs(event.clientX) };
+    const move = (ev) => { const delta = clientToTimelineMs(ev.clientX) - dragState.pointerStartMs; dragState = { ...dragState, previewStartMs: Math.max(0, snapMs(dragState.originalStartMs + delta, 50)) }; wallclockMs = dragState.previewStartMs; };
+    const up = async () => { document.body.classList.remove('dragging-timeline'); window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); const f = dragState; dragState = null; if (f && Math.abs(f.previewStartMs - f.originalStartMs) >= 1) await moveClipTo(clip, f.previewStartMs); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   }
 
   function setWallclockFromClient(clientX) { wallclockMs = snapMs(clientToTimelineMs(clientX), 25); }
-
   function clientToTimelineMs(clientX) {
     if (!timelineViewport) return wallclockMs;
     const rect = timelineViewport.getBoundingClientRect();
@@ -610,63 +559,98 @@
     return Math.min(timelineEndMs, Math.round((x / timelineLaneWidthPx) * timelineEndMs));
   }
 
-  function snapMs(ms, step) { return Math.round(ms / step) * step; }
-  function msToLanePx(ms) { return Math.round((Math.max(0, ms) / timelineEndMs) * timelineLaneWidthPx); }
-  function msToPx(ms) { return msToLanePx(ms); }
-  function maxCells(preset) { return preset === '1x1' ? 1 : preset === '1x2' ? 2 : preset === '2x2' ? 4 : 6; }
-  function format(ms) { const d = new Date(Math.max(0, ms)); return d.toISOString().substring(11, 23); }
-  function inferPerspective(path) { const parts = path.split('/').filter(Boolean); return parts.length > 1 ? parts[parts.length - 2] : 'Default'; }
-
-  function clipBlockStyle(clip, ghost = false) {
-    const isDragged = dragState?.clipId === clip.clipId;
-    const start = isDragged && !ghost ? dragState.previewStartMs : clip.wallclockStartMs;
-    return `left:${msToLanePx(start)}px;width:${Math.max(36, msToLanePx(clip.durationMs || 1000))}px;`;
+  function moveInOrder(listName, id, delta, scopeId = null) {
+    if (listName === 'perspective') { perspectiveOrder = moveItem(perspectiveOrder.length ? perspectiveOrder : perspectiveGroups.map(g => g.id), id, delta); persistPrefs(); return; }
+    const group = scopeId ? perspectiveGroups.find(g => g.id === scopeId) : null;
+    const scopedIds = group ? group.tracks.map(t => t.id) : trackOrder;
+    if (!scopedIds.includes(id)) return;
+    const moved = moveItem(scopedIds, id, delta);
+    const nextOrder = [];
+    for (const p of perspectiveGroups) { const ids = p.id === scopeId ? moved : p.tracks.map(t => t.id); for (const tid of ids) if (!nextOrder.includes(tid)) nextOrder.push(tid); }
+    const all = [...new Set(allClips.map(c => c.trackId))];
+    for (const tid of trackOrder.filter(t => !moved.includes(t)).concat(all.filter(t => !nextOrder.includes(t)))) if (!nextOrder.includes(tid)) nextOrder.push(tid);
+    trackOrder = nextOrder; persistPrefs();
   }
 
-  function markerStyle(marker) { return `left:${msToPx(marker.marker_ts_ms)}px;color:${markerColor(marker)};`; }
-  function regionStyle(region) {
-    const color = regionColor(region);
-    return `left:${msToPx(region.region_start_ms)}px;width:${Math.max(10, msToLanePx(region.region_end_ms - region.region_start_ms))}px;background:${withAlpha(color, '55')};border-color:${withAlpha(color, 'cc')};`;
-  }
-  function markerColor(marker) { return marker.author_color || marker.authorColor || marker.color || me?.color || '#f6c85f'; }
-  function regionColor(region) { return region.author_color || region.authorColor || region.color || me?.color || '#8f70ff'; }
-  function withAlpha(color, alpha) {
-    if (/^#[0-9a-fA-F]{6}$/.test(color)) return `${color}${alpha}`;
-    return color;
+  function moveItem(list, id, delta) {
+    const arr = [...list]; const idx = arr.indexOf(id); if (idx < 0) return arr;
+    const next = Math.max(0, Math.min(arr.length - 1, idx + delta)); if (next === idx) return arr;
+    arr.splice(idx, 1); arr.splice(next, 0, id); return arr;
   }
 
-  function isProjectOwner() { return !!(current && me && current.ownerUsername === me.username); }
-  function annotationAuthor(item) { return item?.author_username || item?.authorUsername || item?.author || 'unknown'; }
-  function canEditAnnotation(item) { return !!(item && me && (annotationAuthor(item) === me.username || isProjectOwner())); }
-  function annotationEditorCanEdit() { return !!(annotationEditor && me && (annotationEditor.author === me.username || isProjectOwner())); }
-  function readOnlyAnnotationMessage() { return 'Read-only: only the author or project owner can edit.'; }
-  function projectOwnerMessage() { return 'Project owner required to align or manage clips.'; }
+  function togglePerspectiveCollapse(id) { collapsedPerspectiveIds = collapsedPerspectiveIds.includes(id) ? collapsedPerspectiveIds.filter(v => v !== id) : [...collapsedPerspectiveIds, id]; persistPrefs(); }
 
-  function perspectiveKey(item) { return item.perspectiveName || item.perspective || 'Default'; }
+  async function togglePerspectiveView(group) {
+    playbackToken += 1;
+    const id = group.id; const ids = group.videoTracks.map(t => t.id);
+    if (!ids.length) return;
+    const enabled = ids.filter(t => visibleTrackIds.includes(t));
+    if (!hiddenPerspectiveIds.includes(id) && enabled.length > 0) {
+      rememberedPerspectiveViewIds = { ...rememberedPerspectiveViewIds, [id]: enabled };
+      visibleTrackIds = visibleTrackIds.filter(t => !ids.includes(t));
+      hiddenPerspectiveIds = [...new Set([...hiddenPerspectiveIds, id])];
+      ids.forEach(disableTrackMedia);
+    } else {
+      const rem = (rememberedPerspectiveViewIds[id] || []).filter(t => ids.includes(t));
+      visibleTrackIds = [...new Set([...visibleTrackIds, ...(rem.length ? rem : enabled.length ? enabled : ids)])];
+      hiddenPerspectiveIds = hiddenPerspectiveIds.filter(v => v !== id);
+    }
+    persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
+  }
+
+  function groupViewEnabled(group) { return !hiddenPerspectiveIds.includes(group.id) && group.videoTracks.some(t => visibleTrackIds.includes(t.id)); }
+  function groupAudioEnabled(group) { return group.audioTracks.some(t => activeAudioIds.includes(t.id)); }
+
+  async function togglePerspectiveAudio(group) {
+    playbackToken += 1;
+    const ids = group.audioTracks.map(t => t.id);
+    if (!ids.length) return;
+    const enabled = ids.filter(id => activeAudioIds.includes(id));
+    if (enabled.length) {
+      rememberedPerspectiveAudioIds = { ...rememberedPerspectiveAudioIds, [group.id]: enabled };
+      activeAudioIds = activeAudioIds.filter(id => !ids.includes(id));
+      ids.forEach(disableTrackMedia);
+    } else {
+      const rem = (rememberedPerspectiveAudioIds[group.id] || []).filter(id => ids.includes(id));
+      activeAudioIds = [...new Set([...activeAudioIds, ...(rem.length ? rem : ids)])];
+    }
+    persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
+  }
+
+  function timelineEnd(clips, playhead) {
+    const mc = clips.reduce((m, c) => Math.max(m, c.wallclockStartMs + Math.max(c.durationMs || 0, 1000)), 0);
+    const mr = regions.reduce((m, r) => Math.max(m, r.region_end_ms || 0), 0);
+    return Math.max(60000, mc + 10000, mr + 10000, playhead + 10000);
+  }
+
+  function makeTicks(end) {
+    const step = end > 20*60*1000 ? 60000 : end > 5*60*1000 ? 30000 : 10000;
+    const t = [];
+    for (let ms = 0; ms <= end; ms += step) t.push(ms);
+    return t;
+  }
 
   function reconcileOrdering() {
     const pKeys = [...new Set(allClips.map(c => perspectiveKey(c)))].sort((a, b) => a.localeCompare(b));
     perspectiveOrder = [...perspectiveOrder.filter(p => pKeys.includes(p)), ...pKeys.filter(p => !perspectiveOrder.includes(p))];
     const tKeys = [...new Set(allClips.map(c => c.trackId))];
     const trackById = new Map(allClips.map(c => [c.trackId, c]));
-    const existingTrackOrder = trackOrder.filter(t => tKeys.includes(t));
-    const knownTrackIds = new Set(existingTrackOrder);
-    const fallbackOrder = [...tKeys].sort((a, b) => {
+    const existing = trackOrder.filter(t => tKeys.includes(t));
+    const known = new Set(existing);
+    const fallback = [...tKeys].sort((a, b) => {
       const ca = trackById.get(a); const cb = trackById.get(b);
-      const pa = perspectiveOrder.indexOf(perspectiveKey(ca));
-      const pb = perspectiveOrder.indexOf(perspectiveKey(cb));
+      const pa = perspectiveOrder.indexOf(perspectiveKey(ca)); const pb = perspectiveOrder.indexOf(perspectiveKey(cb));
       if (pa !== pb) return pa - pb;
       if (ca.kind !== cb.kind) return ca.kind === 'video' ? -1 : 1;
       return String(ca.trackName || '').localeCompare(String(cb.trackName || ''));
     });
-    trackOrder = [...existingTrackOrder, ...fallbackOrder.filter(t => !existingTrackOrder.includes(t))];
+    trackOrder = [...existing, ...fallback.filter(t => !existing.includes(t))];
     visibleTrackIds = visibleTrackIds.filter(id => tKeys.includes(id));
     activeAudioIds = activeAudioIds.filter(id => tKeys.includes(id));
     for (const id of tKeys) {
       const clip = trackById.get(id);
-      const isNewTrack = !knownTrackIds.has(id);
-      if (isNewTrack && clip?.kind === 'video' && !visibleTrackIds.includes(id)) visibleTrackIds = [...visibleTrackIds, id];
-      if (isNewTrack && clip?.kind === 'audio' && !activeAudioIds.includes(id)) activeAudioIds = [...activeAudioIds, id];
+      if (!known.has(id) && clip?.kind === 'video' && !visibleTrackIds.includes(id)) visibleTrackIds = [...visibleTrackIds, id];
+      if (!known.has(id) && clip?.kind === 'audio' && !activeAudioIds.includes(id)) activeAudioIds = [...activeAudioIds, id];
     }
     collapsedPerspectiveIds = collapsedPerspectiveIds.filter(p => pKeys.includes(p));
     hiddenPerspectiveIds = hiddenPerspectiveIds.filter(p => pKeys.includes(p));
@@ -675,276 +659,77 @@
   }
 
   function pruneTrackMemory(memory, validTrackIds, validPerspectiveIds) {
-    const validTracks = new Set(validTrackIds);
-    const validPerspectives = new Set(validPerspectiveIds);
+    const vt = new Set(validTrackIds); const vp = new Set(validPerspectiveIds);
     const next = {};
-    for (const [perspectiveId, ids] of Object.entries(memory || {})) {
-      if (!validPerspectives.has(perspectiveId)) continue;
-      const filtered = [...new Set(Array.isArray(ids) ? ids : [])].filter(id => validTracks.has(id));
-      if (filtered.length) next[perspectiveId] = filtered;
+    for (const [pid, ids] of Object.entries(memory || {})) {
+      if (!vp.has(pid)) continue;
+      const f = [...new Set(Array.isArray(ids) ? ids : [])].filter(id => vt.has(id));
+      if (f.length) next[pid] = f;
     }
     return next;
   }
 
-  function buildPerspectiveGroups(clips, orderedPerspectives = [], orderedTracks = [], collapsedIds = [], hiddenIds = []) {
+  function buildPerspectiveGroups(clips, orderedP = [], orderedT = [], collapsedIds = [], hiddenIds = []) {
     const groups = new Map();
     for (const clip of clips) {
-      const pKey = perspectiveKey(clip);
-      if (!groups.has(pKey)) groups.set(pKey, { id: pKey, name: pKey, tracks: [], clips: [] });
-      const group = groups.get(pKey);
-      group.clips.push(clip);
-      let track = group.tracks.find(t => t.id === clip.trackId);
-      if (!track) {
-        track = { id: clip.trackId, kind: clip.kind, perspectiveName: pKey, trackName: clip.trackName, clips: [] };
-        group.tracks.push(track);
-      }
+      const pk = perspectiveKey(clip);
+      if (!groups.has(pk)) groups.set(pk, { id: pk, name: pk, tracks: [], clips: [] });
+      const g = groups.get(pk); g.clips.push(clip);
+      let track = g.tracks.find(t => t.id === clip.trackId);
+      if (!track) { track = { id: clip.trackId, kind: clip.kind, perspectiveName: pk, trackName: clip.trackName, clips: [] }; g.tracks.push(track); }
       track.clips.push(clip);
     }
-    const pIndex = new Map(orderedPerspectives.map((id, i) => [id, i]));
-    const tIndex = new Map(orderedTracks.map((id, i) => [id, i]));
-    return [...groups.values()].sort((a, b) => (pIndex.get(a.id) ?? 9999) - (pIndex.get(b.id) ?? 9999) || a.name.localeCompare(b.name)).map(group => {
-      group.tracks.sort((a, b) => (tIndex.get(a.id) ?? 9999) - (tIndex.get(b.id) ?? 9999) || (a.kind === b.kind ? a.trackName.localeCompare(b.trackName) : a.kind === 'video' ? -1 : 1));
-      group.videoTracks = group.tracks.filter(t => t.kind === 'video');
-      group.audioTracks = group.tracks.filter(t => t.kind === 'audio');
-      group.collapsed = collapsedIds.includes(group.id);
-      group.hidden = hiddenIds.includes(group.id);
-      return group;
+    const pIdx = new Map(orderedP.map((id, i) => [id, i]));
+    const tIdx = new Map(orderedT.map((id, i) => [id, i]));
+    return [...groups.values()].sort((a, b) => (pIdx.get(a.id) ?? 9999) - (pIdx.get(b.id) ?? 9999) || a.name.localeCompare(b.name)).map(g => {
+      g.tracks.sort((a, b) => (tIdx.get(a.id) ?? 9999) - (tIdx.get(b.id) ?? 9999) || (a.kind === b.kind ? a.trackName.localeCompare(b.trackName) : a.kind === 'video' ? -1 : 1));
+      g.videoTracks = g.tracks.filter(t => t.kind === 'video');
+      g.audioTracks = g.tracks.filter(t => t.kind === 'audio');
+      g.collapsed = collapsedIds.includes(g.id);
+      g.hidden = hiddenIds.includes(g.id);
+      return g;
     });
   }
 
   function flattenTimelineRows(groups) {
     const rows = [];
-    for (const group of groups) {
-      rows.push({ type: 'perspective', id: group.id, perspectiveName: group.name, group });
-      if (group.collapsed) rows.push({ type: 'collapsed', id: `${group.id}:collapsed`, perspectiveName: group.name, group, kind: 'summary', clips: group.clips });
-      else rows.push(...group.tracks.map(track => ({ ...track, type: 'track' })));
+    for (const g of groups) {
+      rows.push({ type: 'perspective', id: g.id, perspectiveName: g.name, group: g });
+      if (g.collapsed) rows.push({ type: 'collapsed', id: `${g.id}:collapsed`, perspectiveName: g.name, group: g, kind: 'summary', clips: g.clips });
+      else rows.push(...g.tracks.map(t => ({ ...t, type: 'track' })));
     }
     return rows;
   }
 
   function buildMonitorCells(groups, enabledTrackIds, hiddenPerspectives, ms) {
     const cells = [];
-    for (const group of groups) {
-      if (hiddenPerspectives.includes(group.id)) continue;
-      const track = group.videoTracks.find(t => enabledTrackIds.includes(t.id));
+    for (const g of groups) {
+      if (hiddenPerspectives.includes(g.id)) continue;
+      const track = g.videoTracks.find(t => enabledTrackIds.includes(t.id));
       if (!track) continue;
       const clips = [...track.clips].sort((a, b) => a.wallclockStartMs - b.wallclockStartMs);
-      cells.push({
-        trackId: track.id,
-        perspectiveId: group.id,
-        perspectiveName: group.name,
-        trackName: track.trackName,
-        clips,
-        activeClip: clips.find(clip => ms >= clip.wallclockStartMs && ms <= clip.wallclockStartMs + clip.durationMs) || null
-      });
+      cells.push({ trackId: track.id, perspectiveId: g.id, perspectiveName: g.name, trackName: track.trackName, clips, activeClip: clips.find(c => ms >= c.wallclockStartMs && ms <= c.wallclockStartMs + c.durationMs) || null });
     }
     return cells;
   }
 
-  function moveInOrder(listName, id, delta, scopeId = null) {
-    if (listName === 'perspective') {
-      const base = perspectiveOrder.length ? perspectiveOrder : perspectiveGroups.map(g => g.id);
-      perspectiveOrder = moveItem(base, id, delta);
-      persistPrefs();
-      return;
-    }
-    const group = scopeId ? perspectiveGroups.find(g => g.id === scopeId) : null;
-    const scopedIds = group ? group.tracks.map(t => t.id) : trackOrder;
-    if (!scopedIds.includes(id)) return;
-    const movedScoped = moveItem(scopedIds, id, delta);
-    const movedById = new Map(movedScoped.map((trackId, index) => [trackId, index]));
-    const allIds = [...new Set(allClips.map(c => c.trackId))];
-    const outside = trackOrder.filter(trackId => !movedById.has(trackId));
-    const missingOutside = allIds.filter(trackId => !movedById.has(trackId) && !outside.includes(trackId));
-    const nextOrder = [];
-    for (const perspective of perspectiveGroups) {
-      const idsForPerspective = perspective.id === scopeId ? movedScoped : perspective.tracks.map(t => t.id);
-      for (const trackId of idsForPerspective) if (!nextOrder.includes(trackId)) nextOrder.push(trackId);
-    }
-    for (const trackId of outside.concat(missingOutside)) if (!nextOrder.includes(trackId)) nextOrder.push(trackId);
-    trackOrder = nextOrder;
-    persistPrefs();
-  }
-
-  function moveItem(list, id, delta) {
-    const arr = [...list];
-    const idx = arr.indexOf(id);
-    if (idx < 0) return arr;
-    const next = Math.max(0, Math.min(arr.length - 1, idx + delta));
-    if (next === idx) return arr;
-    arr.splice(idx, 1);
-    arr.splice(next, 0, id);
-    return arr;
-  }
-
-  function togglePerspectiveCollapse(id) {
-    collapsedPerspectiveIds = collapsedPerspectiveIds.includes(id) ? collapsedPerspectiveIds.filter(v => v !== id) : [...collapsedPerspectiveIds, id];
-    collapsedPerspectiveIds = [...collapsedPerspectiveIds];
-    persistPrefs();
-  }
-
-  async function togglePerspectiveView(group) {
-    playbackToken += 1;
-    const id = group.id;
-    const ids = group.videoTracks.map(t => t.id);
-    if (!ids.length) return;
-    const enabledIds = ids.filter(trackId => visibleTrackIds.includes(trackId));
-    const disabling = !hiddenPerspectiveIds.includes(id) && enabledIds.length > 0;
-    if (disabling) {
-      rememberedPerspectiveViewIds = { ...rememberedPerspectiveViewIds, [id]: enabledIds };
-      visibleTrackIds = visibleTrackIds.filter(trackId => !ids.includes(trackId));
-      hiddenPerspectiveIds = [...new Set([...hiddenPerspectiveIds, id])];
-      ids.forEach(disableTrackMedia);
-    } else {
-      const remembered = (rememberedPerspectiveViewIds[id] || []).filter(trackId => ids.includes(trackId));
-      const restoreIds = remembered.length ? remembered : enabledIds.length ? enabledIds : ids;
-      visibleTrackIds = [...new Set([...visibleTrackIds, ...restoreIds])];
-      hiddenPerspectiveIds = hiddenPerspectiveIds.filter(v => v !== id);
-    }
-    persistPrefs();
-    await tick();
-    attachAll();
-    seekAll();
-    if (playing) await playActiveMedia();
-  }
-
-  function groupViewEnabled(group) {
-    return !hiddenPerspectiveIds.includes(group.id) && group.videoTracks.some(t => visibleTrackIds.includes(t.id));
-  }
-
-  function groupAudioEnabled(group) {
-    return group.audioTracks.some(t => activeAudioIds.includes(t.id));
-  }
-
-  async function togglePerspectiveAudio(group) {
-    playbackToken += 1;
-    const ids = group.audioTracks.map(t => t.id);
-    if (!ids.length) return;
-    const enabledIds = ids.filter(id => activeAudioIds.includes(id));
-    if (enabledIds.length) {
-      rememberedPerspectiveAudioIds = { ...rememberedPerspectiveAudioIds, [group.id]: enabledIds };
-      activeAudioIds = activeAudioIds.filter(id => !ids.includes(id));
-      ids.forEach(disableTrackMedia);
-    } else {
-      const remembered = (rememberedPerspectiveAudioIds[group.id] || []).filter(id => ids.includes(id));
-      const restoreIds = remembered.length ? remembered : ids;
-      activeAudioIds = [...new Set([...activeAudioIds, ...restoreIds])];
-    }
-    persistPrefs();
-    await tick();
-    attachAll();
-    seekAll();
-    if (playing) await playActiveMedia();
-  }
-
-  function timelineEnd(clips, playhead) {
-    const maxClipEnd = clips.reduce((max, clip) => Math.max(max, clip.wallclockStartMs + Math.max(clip.durationMs || 0, 1000)), 0);
-    const maxRegionEnd = regions.reduce((max, region) => Math.max(max, region.region_end_ms || 0), 0);
-    return Math.max(60000, maxClipEnd + 10000, maxRegionEnd + 10000, playhead + 10000);
-  }
-
-  function makeTicks(end) {
-    const step = end > 20 * 60 * 1000 ? 60000 : end > 5 * 60 * 1000 ? 30000 : 10000;
-    const ticks = [];
-    for (let ms = 0; ms <= end; ms += step) ticks.push(ms);
-    return ticks;
-  }
-
-  function streamDetails(stream) {
-    if (stream.kind === 'video') return `${stream.codec || 'video'} ${stream.width || '?'}x${stream.height || '?'}`;
-    return `${stream.codec || 'audio'} ${stream.channels || '?'}ch ${stream.channelLayout || ''}`.trim();
-  }
-
-  function waveBars(clip) {
-    const seed = Number(clip.clipId || clip.trackId || 1) + Number(clip.streamIndex || 0) * 17;
-    return Array.from({ length: 80 }, (_, i) => 18 + Math.abs(Math.sin((i + 1) * (seed % 11 + 3) * 0.37)) * 72);
-  }
-
-
-  function countStatuses(clips) {
-    const counts = { total: clips.length, ready: 0, queued: 0, processing: 0, failed: 0 };
-    for (const clip of clips) {
-      const status = String(clip.ingestStatus || (clip.hlsURL ? 'SUCCESS' : 'PENDING')).toUpperCase();
-      if (status === 'SUCCESS') counts.ready += 1;
-      else if (status === 'PROCESSING') counts.processing += 1;
-      else if (status === 'FAILED') counts.failed += 1;
-      else counts.queued += 1;
-    }
-    return counts;
-  }
-
-  function clipStatus(clip) {
-    return String(clip.ingestStatus || (clip.hlsURL ? 'SUCCESS' : 'PENDING')).toLowerCase();
-  }
-
-  function statusText(clip) {
-    const status = clipStatus(clip);
-    if (status === 'success') return '';
-    if (status === 'processing') return 'processing';
-    if (status === 'failed') return 'failed';
-    return 'queued';
-  }
-
-  function openAnnotationEditor(type, item, event) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    annotationSaved = '';
-    if (type === 'marker') {
-      annotationEditor = {
-        type,
-        id: item.id,
-        label: item.label || '',
-        note: item.note || '',
-        tsMs: Number(item.marker_ts_ms || item.tsMs || 0),
-        color: markerColor(item),
-        author: annotationAuthor(item)
-      };
-      return;
-    }
-    annotationEditor = {
-      type,
-      id: item.id,
-      label: item.label || '',
-      note: item.note || '',
-      startMs: Number(item.region_start_ms || item.startMs || 0),
-      endMs: Number(item.region_end_ms || item.endMs || 0),
-      color: regionColor(item),
-      author: annotationAuthor(item)
-    };
-  }
-
-  async function saveAnnotationEditor() {
-    if (!annotationEditor) return;
-    if (!annotationEditorCanEdit()) { annotationSaved = readOnlyAnnotationMessage(); return; }
-    annotationSaved = 'Saving...';
-    if (annotationEditor.type === 'marker') {
-      await patchJSON(`/api/projects/${current.id}/markers/${annotationEditor.id}`, {
-        tsMs: Number(annotationEditor.tsMs || 0),
-        label: annotationEditor.label,
-        note: annotationEditor.note
-      });
-    } else {
-      await patchJSON(`/api/projects/${current.id}/regions/${annotationEditor.id}`, {
-        startMs: Number(annotationEditor.startMs || 0),
-        endMs: Number(annotationEditor.endMs || 0),
-        label: annotationEditor.label,
-        note: annotationEditor.note
-      });
-    }
-    annotationSaved = 'Saved';
-    await refreshProject();
-  }
-
   function handleKeyDown(event) {
-    if (event.key === 'Escape' && annotationEditor) { event.preventDefault(); annotationEditor = null; annotationSaved = ''; return; }
+    if (event.key === 'Escape') {
+      if (annotationEditor) { event.preventDefault(); annotationEditor = null; annotationSaved = ''; return; }
+      if (showColorPicker) { event.preventDefault(); showColorPicker = false; return; }
+      if (showKeyboardHelp) { event.preventDefault(); showKeyboardHelp = false; return; }
+      if (renameTarget) { event.preventDefault(); renameTarget = null; return; }
+    }
     if (event.target?.tagName === 'INPUT' || event.target?.tagName === 'TEXTAREA') return;
     if (!current) return;
     if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
     if (event.key === 'm' || event.key === 'M') addMarker();
     if (event.key === 'r' || event.key === 'R') addRegion();
+    if (event.key === 'j' || event.key === 'J') { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }
     if (event.key === 'ArrowLeft') { wallclockMs = Math.max(0, wallclockMs - (event.shiftKey ? 1000 : 100)); seekAll(); }
     if (event.key === 'ArrowRight') { wallclockMs += event.shiftKey ? 1000 : 100; seekAll(); }
     if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClip) deleteClip(selectedClip);
+    if (event.key === '?') showKeyboardHelp = !showKeyboardHelp;
   }
 
   async function syncPlayingMedia() {
@@ -953,375 +738,682 @@
     await tick();
     attachAll();
     const targets = playbackTargets();
-    const signature = targets.map(c => `${c.kind}:${c.kind === 'video' ? c.trackId : c.clipId}:${c.clipId}`).join(',');
-    const changedTargets = signature !== previousTargetSignature;
-    previousTargetSignature = signature;
+    const sig = targets.map(c => `${c.kind}:${c.kind === 'video' ? c.trackId : c.clipId}:${c.clipId}`).join(',');
+    const changed = sig !== previousTargetSignature;
+    previousTargetSignature = sig;
     pauseInactiveMedia();
     for (const clip of targets) {
       const node = mediaNodeForClip(clip);
       if (!node) continue;
-      const expected = clipLocalSeconds(wallclockMs, clip, softNudges[clip.clipId] || 0);
-      if (expected >= 0 && expected * 1000 <= clip.durationMs && (changedTargets || Math.abs(node.currentTime - expected) > 0.45)) seekNode(node, expected);
+      const exp = clipLocalSeconds(wallclockMs, clip, softNudges[clip.clipId] || 0);
+      if (exp >= 0 && exp * 1000 <= clip.durationMs && (changed || Math.abs(node.currentTime - exp) > 0.45)) seekNode(node, exp);
       if (clip.kind === 'audio') node.muted = false;
       if (node.paused && isClipPlaybackEnabled(clip)) await safePlay(node, clip);
     }
   }
+
+  function snapMs(ms, step) { return Math.round(ms / step) * step; }
+  function msToLanePx(ms) { return Math.round((Math.max(0, ms) / timelineEndMs) * timelineLaneWidthPx); }
+  function msToPx(ms) { return msToLanePx(ms); }
+  function maxCells(p) { return p === '1x1' ? 1 : p === '1x2' ? 2 : p === '2x2' ? 4 : 6; }
+  function format(ms) { const d = new Date(Math.max(0, ms)); return d.toISOString().substring(11, 23); }
+  function inferPerspective(path) { const parts = path.split('/').filter(Boolean); return parts.length > 1 ? parts[parts.length - 2] : 'Default'; }
+  function clipBlockStyle(clip, ghost = false) {
+    const isDragged = dragState?.clipId === clip.clipId;
+    const start = isDragged && !ghost ? dragState.previewStartMs : clip.wallclockStartMs;
+    return `left:${msToLanePx(start)}px;width:${Math.max(36, msToLanePx(clip.durationMs || 1000))}px;`;
+  }
+  function markerStyle(m) { return `left:${msToPx(m.marker_ts_ms)}px;color:${markerColor(m)};`; }
+  function regionStyle(r) {
+    const c = regionColor(r);
+    return `left:${msToPx(r.region_start_ms)}px;width:${Math.max(10, msToLanePx(r.region_end_ms - r.region_start_ms))}px;background:${withAlpha(c,'33')};border-color:${withAlpha(c,'aa')};`;
+  }
+  function markerColor(m) { return m.author_color || m.authorColor || m.color || me?.color || '#f6c85f'; }
+  function regionColor(r) { return r.author_color || r.authorColor || r.color || me?.color || '#8f70ff'; }
+  function withAlpha(c, a) { return /^#[0-9a-fA-F]{6}$/.test(c) ? `${c}${a}` : c; }
+  function isProjectOwner() { return !!(current && me && current.ownerUsername === me.username); }
+  function annotationAuthor(item) { return item?.author_username || item?.authorUsername || item?.author || 'unknown'; }
+  function canEditAnnotation(item) { return !!(item && me && (annotationAuthor(item) === me.username || isProjectOwner())); }
+  function annotationEditorCanEdit() { return !!(annotationEditor && me && (annotationEditor.author === me.username || isProjectOwner())); }
+  function readOnlyAnnotationMessage() { return 'Read-only: only the author or project owner can edit.'; }
+  function projectOwnerMessage() { return 'Only the project owner can do this.'; }
+  function perspectiveKey(item) { return item.perspectiveName || item.perspective || 'Default'; }
+  function streamDetails(s) { return s.kind === 'video' ? `${s.codec||'video'} ${s.width||'?'}×${s.height||'?'}` : `${s.codec||'audio'} ${s.channels||'?'}ch`.trim(); }
+  function waveBars(clip) {
+    const seed = Number(clip.clipId || clip.trackId || 1) + Number(clip.streamIndex || 0) * 17;
+    return Array.from({ length: 80 }, (_, i) => 18 + Math.abs(Math.sin((i + 1) * (seed % 11 + 3) * 0.37)) * 72);
+  }
+  function countStatuses(clips) {
+    const c = { total: clips.length, ready: 0, queued: 0, processing: 0, failed: 0 };
+    for (const clip of clips) {
+      const s = String(clip.ingestStatus || (clip.hlsURL ? 'SUCCESS' : 'PENDING')).toUpperCase();
+      if (s === 'SUCCESS') c.ready++; else if (s === 'PROCESSING') c.processing++; else if (s === 'FAILED') c.failed++; else c.queued++;
+    }
+    return c;
+  }
+  function clipStatus(clip) { return String(clip.ingestStatus || (clip.hlsURL ? 'SUCCESS' : 'PENDING')).toLowerCase(); }
+  function statusText(clip) { const s = clipStatus(clip); return s === 'success' ? '' : s === 'processing' ? 'encoding' : s === 'failed' ? 'failed' : 'queued'; }
+
+  const ACCENT_COLORS = ['#ff6c70','#f6c85f','#33c899','#5d94ff','#b882ff','#ff9d5c','#60d8ff','#ff72b8'];
 </script>
 
 {#if !me}
-  <main class="login-shell">
-    <section class="login-card">
-      <p class="eyebrow">Self-hosted multicam review</p>
-      <h1>Multitrack Drifter</h1>
-      <label>Username<input bind:value={username} /></label>
-      <label>Password<input bind:value={password} type="password" /></label>
-      <button onclick={login}>Log in</button>
-      {#if error}<p class="error">{error}</p>{/if}
-      <p class="muted">Development auth accepts any username/password when DEV_AUTH_ENABLED=true.</p>
-    </section>
-  </main>
+<main class="login-shell">
+  <section class="login-card">
+    <div class="login-brand">
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="15" stroke="#5d94ff" stroke-width="1.5"/><path d="M9 22V10l7 4.5 7-4.5v12l-7-4.5L9 22z" fill="#5d94ff"/></svg>
+      <span>DRIFTER</span>
+    </div>
+    <p class="login-sub">Self-hosted multicam review</p>
+    <label>Username<input bind:value={username} autocomplete="username" /></label>
+    <label>Password<input bind:value={password} type="password" autocomplete="current-password" /></label>
+    <button class="btn-primary full" onclick={login}>Sign in</button>
+    {#if error}<p class="error">{error}</p>{/if}
+    <p class="muted hint-small">Dev auth accepts any credentials when DEV_AUTH_ENABLED=true.</p>
+  </section>
+</main>
+
 {:else}
-  <main class="app-shell">
-    <header class="topbar">
-      <div class="brand">
-        <button class="projects-button" onclick={() => showProjectPicker = !showProjectPicker}>Projects</button>
-        <strong>Drifter</strong><span>{current ? current.name : 'No project open'}</span>
-      </div>
-      <div class="transport-mini">
-        <button onclick={togglePlay} disabled={!current}>{playing ? 'Pause' : 'Play'}</button>
-        <button class="secondary" onclick={() => { wallclockMs = Math.max(0, wallclockMs - 5000); seekAll(); }} disabled={!current}>-5s</button>
-        <strong>{format(wallclockMs)}</strong>
-        <button class="secondary" onclick={() => { wallclockMs += 5000; seekAll(); }} disabled={!current}>+5s</button>
-        {#if started}<button class="audio-chip" onclick={startSession} title="Audio unlocked — click to re-sync if audio stops">♪ Audio on</button>{/if}
-        {#if current && (statusCounts.processing + statusCounts.queued + statusCounts.failed > 0)}<span class="status-strip"><b>{statusCounts.processing + statusCounts.queued}</b> preparing <b class:bad={statusCounts.failed > 0}>{statusCounts.failed}</b> failed</span>{/if}
-      </div>
-      <div class="user-chip"><span style={`background:${me.color}`}></span>{me.displayName}<button class="secondary" onclick={logout}>Logout</button></div>
-    </header>
+<main class="app-shell">
 
-    {#if showProjectPicker}
-      <section class="project-popover panel">
-        <div class="panel-title"><h2>Projects</h2><button class="secondary" onclick={() => showProjectPicker = false}>Close</button></div>
-        <div class="project-list">
-          {#each projects as p}<button class:active={current?.id === p.id} class="secondary" onclick={() => { openProject(p.id); showProjectPicker = false; }}>{p.name}</button>{/each}
-        </div>
-        <div class="create-row"><input bind:value={newProjectName}><button onclick={createProject}>New</button></div>
-      </section>
-    {/if}
-
-    <aside class="media-rail">
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="topbar-icon-btn" onclick={() => showProjectPicker = !showProjectPicker} title="Projects">
+        <svg width="14" height="14" viewBox="0 0 14 14"><rect x="1" y="1" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="8" y="1" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="1" y="8" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="8" y="8" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+      </button>
+      <span class="brand-wordmark">DRIFTER</span>
+      <span class="topbar-divider"></span>
       {#if current}
-        <section class="panel media-bin">
-          <div class="panel-title"><h2>Add footage</h2><button class="secondary" onclick={() => browseSources(parentPrefix(sourcePrefix))}>Up</button></div>
-          <p class="path-chip">/{sourcePrefix}</p>
-          <div class="source-list">
-            {#each sources as item}
-              {#if item.isPrefix}
-                <button class="source-item folder" title={item.ref.path} onclick={() => browseSources(item.ref.path)}>▸ {item.ref.path}</button>
-              {:else}
-                <button class="source-item" title={item.ref.path} onclick={() => inspectSource(item.ref.path)}>+ {item.name}</button>
-              {/if}
-            {/each}
-          </div>
-          {#if importProbe}
-            <div class="stream-sheet">
-              <div class="panel-title"><strong>{importProbe.name}</strong><button class="secondary" onclick={() => { importProbe = null; importStreams = []; importError = ''; }}>Cancel</button></div>
-              <label>Perspective<input bind:value={importPerspective} /></label>
-              {#each importStreams as stream}
-                <div class="stream-row">
-                  <label class="checkline"><input type="checkbox" bind:checked={stream.selected}><strong>{stream.kind.toUpperCase()} {stream.index}</strong><span>{streamDetails(stream)}</span></label>
-                  <input bind:value={stream.track} aria-label="Track name" />
-                  <input bind:value={stream.displayName} aria-label="Clip name" />
-                </div>
-              {/each}
-              <button onclick={addSelectedStreams}>Add selected streams</button>
-              {#if importError}<p class="error">{importError}</p>{/if}
-            </div>
-          {/if}
-          {#if error}<p class="error error-dismissible">{error}<button class="error-close" onclick={() => { error = ''; }} aria-label="Dismiss">×</button></p>{/if}
-        </section>
+        <button class="project-title-btn" onclick={() => { if (isProjectOwner()) { editingProjectName = current.name; editingProjectDesc = current.description || ''; showProjectEdit = true; } }} title={isProjectOwner() ? 'Click to edit project' : current.name}>
+          {current.name}
+        </button>
+        {#if !isProjectOwner()}
+          <span class="owner-tag">{current.ownerUsername}</span>
+        {/if}
       {:else}
-        <section class="panel empty-media"><p class="muted">Open a project from the Projects button.</p></section>
+        <span class="no-project-label">No project</span>
       {/if}
-    </aside>
+    </div>
 
-    {#if current}
-      <section class="workspace">
-        <section class="monitor-panel panel">
-          <div class="panel-title">
-            <h2>Program Monitor</h2>
-            <div class="segmented">
-              {#each ['1x1','1x2','2x2','2x3'] as preset}
-                <button class:active={gridPreset === preset} class="secondary" onclick={() => { gridPreset = preset; persistPrefs(); }}>{preset}</button>
-              {/each}
-            </div>
-          </div>
-          {#if !started}
-            <button class="start-overlay" onclick={startSession}>Start review / enable audio</button>
-          {/if}
-          <div class={`video-grid preset-${gridPreset}`}>
-            {#each monitorCells as cell (cell.trackId)}
-              <div class="cell">
-                <video muted playsinline preload="auto" use:setTrackMedia={cell.trackId} use:fitVideoToCell></video>
-                {#if cell.activeClip}
-                  {#if !cell.activeClip.hlsURL}
-                    <div class={`media-state ${clipStatus(cell.activeClip)}`}>{statusText(cell.activeClip)}</div>
-                  {/if}
-                  <button class="cell-label" title={`${cell.perspectiveName} / ${cell.trackName}`} onclick={() => selectedClipId = cell.activeClip.clipId}>{cell.perspectiveName} / {cell.trackName}</button>
-                {:else}
-                  <div class="gap-state">Gap on {cell.perspectiveName} / {cell.trackName}</div>
-                  <button class="cell-label" title={`${cell.perspectiveName} / ${cell.trackName}`}>{cell.perspectiveName} / {cell.trackName}</button>
-                {/if}
-              </div>
-            {:else}
-              <div class="empty-monitor">Add footage, then enable a video track in the timeline header.</div>
-            {/each}
-          </div>
-        </section>
+    <div class="topbar-center">
+      <button class="tb-jog" onclick={() => { wallclockMs = Math.max(0, wallclockMs - 10000); seekAll(); }} disabled={!current} title="−10s (Shift+←)">⏮</button>
+      <button class="tb-jog" onclick={() => { wallclockMs = Math.max(0, wallclockMs - 1000); seekAll(); }} disabled={!current} title="−1s">◂</button>
+      <button class="tb-play {playing ? 'tb-playing' : ''}" onclick={togglePlay} disabled={!current} title={playing ? 'Pause' : 'Play'}>
+        {#if playing}■{:else}▶{/if}
+      </button>
+      <button class="tb-jog" onclick={() => { wallclockMs += 1000; seekAll(); }} disabled={!current} title="+1s">▸</button>
+      <button class="tb-jog" onclick={() => { wallclockMs += 10000; seekAll(); }} disabled={!current} title="+10s">⏭</button>
+      <span class="timecode-display">{format(wallclockMs)}</span>
+      {#if started}
+        <button class="audio-live-btn" onclick={startSession} title="Audio unlocked — click to re-sync">♪ LIVE</button>
+      {/if}
+    </div>
 
-        <section class="timeline-panel panel">
-          <div class="timeline-toolbar">
-            <div class="row-tight">
-              <button onclick={togglePlay}>{playing ? 'Pause' : 'Play'}</button>
-              <button class="secondary" onclick={addMarker}>Marker</button>
-              <button class="secondary" onclick={addRegion}>5s Region</button>
-              <button class="secondary" onclick={ingest} disabled={statusCounts.queued + statusCounts.processing === 0 && statusCounts.failed === 0}>Retry prepare</button>
-              {#if statusCounts.queued + statusCounts.processing + statusCounts.failed > 0}<span class="prepare-readout"><b>{statusCounts.queued}</b> queued · <b>{statusCounts.processing}</b> running · <b class:bad={statusCounts.failed > 0}>{statusCounts.failed}</b> failed</span>{/if}
-            </div>
-            <div class="hint">Drag ruler = scrub. Drag clips = align. M = marker.</div>
-          </div>
-
-          <div class="timeline-body">
-            <div class="timeline-label-rail">
-              <div class="timeline-rail-corner"></div>
-              {#each trackRows as row}
-                {#if row.type === 'perspective'}
-                  <div class="rail-perspective-row">
-                    <div class="perspective-head">
-                      <button class="mini" title="Move perspective up" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); moveInOrder('perspective', row.id, -1); }}>▲</button>
-                      <button class="mini" title="Move perspective down" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); moveInOrder('perspective', row.id, 1); }}>▼</button>
-                      <button class="collapse-button" onpointerdown={(event) => event.stopPropagation()} onclick={() => togglePerspectiveCollapse(row.id)}>{row.group.collapsed ? '▸' : '▾'} {row.perspectiveName}</button>
-                      <button class:armed={groupViewEnabled(row.group)} class="track-toggle" title="Show/hide this perspective in the grid" onclick={() => togglePerspectiveView(row.group)}>View</button>
-                      <button class:armed={groupAudioEnabled(row.group)} class="track-toggle audio-toggle" title="Enable/disable all audio tracks in this perspective" onclick={() => togglePerspectiveAudio(row.group)}>Hear</button>
-                    </div>
-                  </div>
-                {:else if row.type === 'collapsed'}
-                  <div class="rail-track-row collapsed summary">
-                    <div class="track-head summary-head">
-                      <strong>{row.perspectiveName}</strong>
-                      <span>summary view</span>
-                    </div>
-                  </div>
-                {:else}
-                  <div class={`rail-track-row ${row.kind}`}>
-                    <div class="track-head">
-                      <div class="track-move">
-                        <button class="mini" title="Move track up" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); moveInOrder('track', row.id, -1, row.perspectiveName); }}>▲</button>
-                        <button class="mini" title="Move track down" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); moveInOrder('track', row.id, 1, row.perspectiveName); }}>▼</button>
-                      </div>
-                      <strong>{row.perspectiveName}</strong>
-                      <span>{row.trackName}</span>
-                      {#if row.kind === 'video'}
-                        <button class:armed={visibleTrackIds.includes(row.id)} class="track-toggle" onclick={() => toggleTrack('video', row.id)}>View</button>
-                      {:else}
-                        <button class:armed={activeAudioIds.includes(row.id)} class="track-toggle audio-toggle" onclick={() => toggleTrack('audio', row.id)}>Hear</button>
-                      {/if}
-                    </div>
-                  </div>
-                {/if}
-              {/each}
-            </div>
-
-            <div class="timeline-scroll" bind:this={timelineViewport}>
-              <div class="timeline-canvas" bind:this={timelineCanvas} style={`width:${timelineWidthPx}px`}>
-                <div class="ruler" onpointerdown={startPlayheadDrag}>
-                  {#each tickMarks as tick}
-                    <div class="tick" style={`left:${msToPx(tick)}px`}><span>{format(tick)}</span></div>
-                  {/each}
-                  {#each markers as marker}
-                    <button class="marker-pin" style={markerStyle(marker)} title={marker.label} onpointerdown={(event) => openAnnotationEditor('marker', marker, event)}>◆</button>
-                  {/each}
-                  {#each regions as region}
-                    <button class="region-band" style={regionStyle(region)} title={region.label} onpointerdown={(event) => openAnnotationEditor('region', region, event)}></button>
-                  {/each}
-                </div>
-
-                <div class="playhead" style={`left:${msToPx(wallclockMs)}px`} onpointerdown={startPlayheadDrag}><span></span></div>
-
-                {#each trackRows as row}
-                  {#if row.type === 'perspective'}
-                    <div class="lane-perspective-row">
-                      <div class="perspective-lane"><span>{row.group.videoTracks.length} video · {row.group.audioTracks.length} audio</span></div>
-                    </div>
-                  {:else if row.type === 'collapsed'}
-                    <div class="lane-track-row collapsed summary">
-                      <div class="track-lane summary-lane" onpointerdown={startPlayheadDrag}>
-                        {#each row.clips as clip (clip.clipId)}
-                          <button
-                            class={`clip-block ${clip.kind} ${clipStatus(clip)} summary-clip`}
-                            class:selected={selectedClipId === clip.clipId}
-                            title={`${clip.displayName || clip.trackName} · ${clip.kind}`}
-                            style={clipBlockStyle(clip)}
-                            onpointerdown={(event) => startClipDrag(event, clip)}
-                            onclick={() => { selectedClipId = clip.clipId; persistPrefs(); }}
-                          >
-                            {#if clip.kind === 'audio'}
-                              <span class="waveform" aria-hidden="true">{#each waveBars(clip) as h}<i style={`height:${h}%`}></i>{/each}</span>
-                            {:else}
-                              <span class="video-stripes" aria-hidden="true"></span>
-                            {/if}
-                          </button>
-                        {/each}
-                      </div>
-                    </div>
-                  {:else}
-                    <div class={`lane-track-row ${row.kind}`}>
-                      <div class="track-lane" onpointerdown={startPlayheadDrag}>
-                        {#each row.clips as clip (clip.clipId)}
-                          {#if dragState?.clipId === clip.clipId}
-                            <div class={`clip-block ghost ${clip.kind}`} style={clipBlockStyle(clip, true)}>{clip.displayName}</div>
-                          {/if}
-                          <button
-                            class={`clip-block ${clip.kind} ${clipStatus(clip)}`}
-                            class:selected={selectedClipId === clip.clipId}
-                            class:dragging={dragState?.clipId === clip.clipId}
-                            title={`${clip.displayName || clip.trackName} · ${statusText(clip)}`}
-                            style={clipBlockStyle(clip)}
-                            onpointerdown={(event) => startClipDrag(event, clip)}
-                            onclick={() => { selectedClipId = clip.clipId; persistPrefs(); }}
-                          >
-                            <span class="clip-title">{clip.displayName || clip.trackName}</span>
-                            {#if clipStatus(clip) !== 'success'}<span class={`clip-status ${clipStatus(clip)}`}>{statusText(clip)}</span>{/if}
-                            {#if clip.kind === 'audio'}
-                              <span class="waveform" aria-hidden="true">{#each waveBars(clip) as h}<i style={`height:${h}%`}></i>{/each}</span>
-                            {:else}
-                              <span class="video-stripes" aria-hidden="true"></span>
-                            {/if}
-                            <span class="clip-meta">{format(clip.wallclockStartMs)} · {format(clip.durationMs)}</span>
-                            {#if isProjectOwner()}<span class="clip-delete" role="button" tabindex="0" onclick={(event) => { event.stopPropagation(); deleteClip(clip); }}>×</span>{/if}
-                          </button>
-                        {/each}
-                      </div>
-                    </div>
-                  {/if}
-                {:else}
-                  <div class="empty-timeline">Add footage from the left. The app prepares browser-playable review media automatically.</div>
-                {/each}
-              </div>
-            </div>
-          </div>
-        </section>
-      </section>
-
-      {#if annotationEditor}
-        <section class="annotation-popover" style={`--annotation-color:${annotationEditor.color}`}>
-          <div class="popover-title">
-            <strong>{annotationEditor.type === 'marker' ? 'Marker note' : 'Region note'}</strong>
-            <button class="secondary" onclick={() => { annotationEditor = null; annotationSaved = ''; }}>Close</button>
-          </div>
-          <p class="annotation-meta">Author: <strong>{annotationEditor.author}</strong></p>
-          <label>Label<input bind:value={annotationEditor.label} disabled={!annotationEditorCanEdit()} /></label>
-          {#if annotationEditor.type === 'marker'}
-            <label>Time <span class="label-hint">{format(annotationEditor.tsMs)}</span><input type="number" bind:value={annotationEditor.tsMs} disabled={!annotationEditorCanEdit()} /></label>
-          {:else}
-            <div class="two-cols">
-              <label>Start <span class="label-hint">{format(annotationEditor.startMs)}</span><input type="number" bind:value={annotationEditor.startMs} disabled={!annotationEditorCanEdit()} /></label>
-              <label>End <span class="label-hint">{format(annotationEditor.endMs)}</span><input type="number" bind:value={annotationEditor.endMs} disabled={!annotationEditorCanEdit()} /></label>
-            </div>
-          {/if}
-          <label>Note<textarea bind:value={annotationEditor.note} rows="7" placeholder="Type marker notes here. This stays open until Close or Esc." disabled={!annotationEditorCanEdit()}></textarea></label>
-          <div class="popover-actions"><span>{annotationEditorCanEdit() ? annotationSaved : readOnlyAnnotationMessage()}</span><button onclick={saveAnnotationEditor} disabled={!annotationEditorCanEdit()}>Save</button></div>
-        </section>
+    <div class="topbar-right">
+      {#if current && (statusCounts.processing + statusCounts.queued + statusCounts.failed > 0)}
+        <button class="status-chip {statusCounts.failed > 0 ? 'chip-warn' : 'chip-info'}" onclick={() => { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }}>
+          {#if statusCounts.processing > 0}<span class="pulse-dot"></span>{/if}
+          {statusCounts.queued + statusCounts.processing} preparing
+          {#if statusCounts.failed > 0} · <strong>{statusCounts.failed} failed</strong>{/if}
+        </button>
+      {:else if current && statusCounts.total > 0}
+        <span class="status-chip chip-ok">{statusCounts.ready}/{statusCounts.total}</span>
       {/if}
 
-      <div class="audio-deck" aria-label="active audio playback elements">
-        {#each audioClips as clip (clip.clipId)}
-          {#if clip.hlsURL}
-            <audio preload="auto" use:setMedia={clip.clipId}></audio>
-          {/if}
+      <span class="ws-indicator {wsConnected ? 'ws-live' : 'ws-dead'}" title={wsConnected ? 'Connected' : 'Disconnected'}></span>
+
+      <div class="presence-group">
+        {#each presenceUsers.filter(u => u.username !== me?.username).slice(0, 6) as u}
+          <span class="presence-dot" style="background:{u.color}" title={u.username}>{u.username[0]?.toUpperCase()}</span>
         {/each}
       </div>
 
-      <aside class="inspector panel">
-        <div class="panel-title"><h2>Inspector</h2><button class="secondary" onclick={refreshProject}>Refresh</button></div>
-        {#if selectedClip}
-          <section class="inspect-card">
-            <p class="eyebrow">Selected clip</p>
-            <h3>{selectedClip.displayName}</h3>
-            <dl>
-              <dt>Track</dt><dd>{selectedClip.perspectiveName} / {selectedClip.trackName}</dd>
-              <dt>Kind</dt><dd>{selectedClip.kind} · stream {selectedClip.streamIndex}</dd>
-              <dt>Start</dt><dd>{format(selectedClip.wallclockStartMs)}</dd>
-              <dt>Duration</dt><dd>{format(selectedClip.durationMs)}</dd>
-            </dl>
-            <div class="nudge-grid">
-              <button class="secondary" onclick={() => moveClip(selectedClip, -1000)} disabled={!isProjectOwner()}>-1s</button>
-              <button class="secondary" onclick={() => moveClip(selectedClip, -100)} disabled={!isProjectOwner()}>-100ms</button>
-              <button class="secondary" onclick={() => moveClip(selectedClip, 100)} disabled={!isProjectOwner()}>+100ms</button>
-              <button class="secondary" onclick={() => moveClip(selectedClip, 1000)} disabled={!isProjectOwner()}>+1s</button>
-            </div>
-            {#if !isProjectOwner()}<p class="muted">Project owner required to align, rename, or delete clips.</p>{/if}
-            <button class="secondary" onclick={renameSelectedClip} disabled={!isProjectOwner()}>Rename</button>
-            <button class="danger" onclick={() => deleteClip(selectedClip)} disabled={!isProjectOwner()}>Delete clip</button>
-          </section>
+      <button class="user-chip-btn" onclick={() => showColorPicker = !showColorPicker} title="Change accent color">
+        <span class="user-color-dot" style="background:{me.color}"></span>
+        <span class="user-chip-name">{me.displayName || me.username}</span>
+      </button>
+      <button class="topbar-icon-btn" onclick={logout} title="Sign out">⏻</button>
+      <button class="topbar-icon-btn" onclick={() => showKeyboardHelp = !showKeyboardHelp} title="Keyboard shortcuts (?)">?</button>
+    </div>
+  </header>
+
+  <!-- FLOATS / POPOVERS -->
+  {#if showColorPicker}
+    <div class="float-panel color-float">
+      <div class="float-head"><span>Accent color</span><button class="topbar-icon-btn" onclick={() => showColorPicker = false}>×</button></div>
+      <div class="color-swatches">
+        {#each ACCENT_COLORS as c}
+          <button class="color-swatch {me.color === c ? 'swatch-active' : ''}" style="background:{c}" onclick={() => setMyColor(c)}></button>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  {#if showProjectPicker}
+    <div class="float-panel project-float">
+      <div class="float-head"><span>Projects</span><button class="topbar-icon-btn" onclick={() => showProjectPicker = false}>×</button></div>
+      <div class="project-scroll">
+        {#each projects as p}
+          <button class="project-item {current?.id === p.id ? 'proj-active' : ''}" onclick={() => { openProject(p.id); showProjectPicker = false; }}>
+            <span class="proj-name">{p.name}</span>
+            <span class="proj-owner">{p.ownerUsername}</span>
+          </button>
         {:else}
-          <p class="muted">Select a clip in the timeline to rename, nudge, or delete it.</p>
-        {/if}
+          <p class="muted padded">No projects yet.</p>
+        {/each}
+      </div>
+      <div class="float-footer">
+        <input bind:value={newProjectName} placeholder="New project name" />
+        <button onclick={() => { createProject(); showProjectPicker = false; }}>Create</button>
+      </div>
+    </div>
+  {/if}
 
-        <section class="inspect-card mixer-card">
-          <h3>Audio mixer</h3>
-          <div class="mixer-list">
+  {#if showProjectEdit}
+    <div class="float-panel project-edit-float">
+      <div class="float-head"><span>Edit project</span><button class="topbar-icon-btn" onclick={() => showProjectEdit = false}>×</button></div>
+      <label>Name<input bind:value={editingProjectName} /></label>
+      <label>Description<textarea bind:value={editingProjectDesc} rows="2"></textarea></label>
+      <div class="float-footer">
+        <button onclick={saveProjectEdit}>Save</button>
+        <button class="btn-ghost" onclick={() => showProjectEdit = false}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if showKeyboardHelp}
+    <div class="float-panel kbd-float">
+      <div class="float-head"><span>Keyboard shortcuts</span><button class="topbar-icon-btn" onclick={() => showKeyboardHelp = false}>×</button></div>
+      <table class="kbd-table">
+        <tbody>
+          <tr><td><kbd>Space</kbd></td><td>Play / Pause</td></tr>
+          <tr><td><kbd>M</kbd></td><td>Add marker at playhead</td></tr>
+          <tr><td><kbd>R</kbd></td><td>Add 5s region at playhead</td></tr>
+          <tr><td><kbd>J</kbd></td><td>Toggle jobs panel</td></tr>
+          <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>±100ms</td></tr>
+          <tr><td><kbd>⇧←</kbd> / <kbd>⇧→</kbd></td><td>±1s</td></tr>
+          <tr><td><kbd>Del</kbd></td><td>Delete selected clip</td></tr>
+          <tr><td><kbd>?</kbd></td><td>This help</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close panel</td></tr>
+        </tbody>
+      </table>
+    </div>
+  {/if}
+
+  {#if showIngestPanel && current}
+    <div class="float-panel ingest-float">
+      <div class="float-head">
+        <span>Ingest jobs</span>
+        <div class="float-head-actions">
+          <button class="btn-sm" onclick={ingest}>Retry all</button>
+          <button class="topbar-icon-btn" onclick={refreshIngestJobs} title="Refresh">⟳</button>
+          <button class="topbar-icon-btn" onclick={() => showIngestPanel = false}>×</button>
+        </div>
+      </div>
+      <div class="job-scroll">
+        {#each ingestJobs.slice(0, 60) as job}
+          <div class="job-row">
+            <span class="job-badge {job.state === 'SUCCESS' ? 'jb-ok' : job.state === 'FAILED' ? 'jb-fail' : job.state === 'PROCESSING' ? 'jb-run' : 'jb-pend'}">{job.state}</span>
+            <span class="job-id">#{job.id}</span>
+            <span class="job-clip muted">clip {job.clip_id}</span>
+            {#if job.error}<span class="job-err" title={job.error}>⚠</span>{/if}
+            {#if job.state === 'FAILED'}
+              <button class="btn-sm btn-warn-sm" onclick={() => retryClipIngest(job.clip_id)}>Retry</button>
+            {/if}
+          </div>
+        {:else}
+          <p class="muted padded">No jobs.</p>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  {#if annotationEditor}
+    <div class="float-panel ann-float" style="--ann:{annotationEditor.color}">
+      <div class="float-head">
+        <span class="ann-type-tag">{annotationEditor.type === 'marker' ? '◆ Marker' : '▬ Region'}</span>
+        <button class="topbar-icon-btn" onclick={() => { annotationEditor = null; annotationSaved = ''; }}>×</button>
+      </div>
+      <p class="ann-meta">by <strong>{annotationEditor.author}</strong></p>
+      <label>Label<input bind:value={annotationEditor.label} disabled={!annotationEditorCanEdit()} /></label>
+      {#if annotationEditor.type === 'marker'}
+        <label>Time <span class="label-hint">{format(annotationEditor.tsMs)}</span>
+          <input type="number" bind:value={annotationEditor.tsMs} disabled={!annotationEditorCanEdit()} />
+        </label>
+      {:else}
+        <div class="two-col-inputs">
+          <label>Start <span class="label-hint">{format(annotationEditor.startMs)}</span>
+            <input type="number" bind:value={annotationEditor.startMs} disabled={!annotationEditorCanEdit()} />
+          </label>
+          <label>End <span class="label-hint">{format(annotationEditor.endMs)}</span>
+            <input type="number" bind:value={annotationEditor.endMs} disabled={!annotationEditorCanEdit()} />
+          </label>
+        </div>
+      {/if}
+      <label>Note<textarea bind:value={annotationEditor.note} rows="5" placeholder="Notes…" disabled={!annotationEditorCanEdit()}></textarea></label>
+      <div class="float-footer">
+        <span class="save-msg">{annotationEditorCanEdit() ? annotationSaved : readOnlyAnnotationMessage()}</span>
+        <button onclick={saveAnnotationEditor} disabled={!annotationEditorCanEdit()}>Save</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if renameTarget}
+    <div class="float-panel rename-float">
+      <div class="float-head"><span>Rename {renameTarget.type}</span><button class="topbar-icon-btn" onclick={() => renameTarget = null}>×</button></div>
+      <input bind:value={renameValue} onkeydown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') renameTarget = null; }} />
+      <div class="float-footer"><button onclick={commitRename}>Rename</button></div>
+    </div>
+  {/if}
+
+  {#if current}
+  <div class="body-cols">
+
+    <!-- LEFT: Source browser -->
+    <aside class="left-panel">
+      <div class="panel-head"><span class="panel-label">Sources</span>
+        {#if sourcePrefix}<button class="topbar-icon-btn" onclick={() => browseSources(parentPrefix(sourcePrefix))} title="Up">↑</button>{/if}
+      </div>
+      {#if sourcePrefix}
+        <div class="breadcrumb">
+          <button class="crumb" onclick={() => browseSources('')}>root</button>
+          {#each sourcePrefix.split('/').filter(Boolean) as part, i}
+            <span class="crumb-sep">/</span>
+            <button class="crumb" onclick={() => browseSources(sourcePrefix.split('/').filter(Boolean).slice(0, i+1).join('/') + '/')}>{part}</button>
+          {/each}
+        </div>
+      {/if}
+      <div class="source-file-list">
+        {#each sources as item}
+          {#if item.isPrefix}
+            <button class="src-row src-folder" title={item.ref.path} onclick={() => browseSources(item.ref.path)}>
+              <span class="src-icon-folder">📁</span>
+              <span class="src-name">{item.ref.path.split('/').filter(Boolean).pop()}/</span>
+            </button>
+          {:else}
+            <button class="src-row src-file" title={item.ref.path} onclick={() => inspectSource(item.ref.path)}>
+              <span class="src-icon-file">🎬</span>
+              <span class="src-name">{item.name}</span>
+            </button>
+          {/if}
+        {:else}
+          <p class="muted padded">No files.</p>
+        {/each}
+      </div>
+
+      {#if importProbe}
+        <div class="import-sheet">
+          <div class="import-head">
+            <div class="import-head-text">
+              <span class="import-fname">{importProbe.name}</span>
+              <span class="import-size muted">{(importProbe.sizeBytes / 1e6).toFixed(1)} MB</span>
+            </div>
+            <button class="topbar-icon-btn" onclick={() => { importProbe = null; importStreams = []; importError = ''; }}>×</button>
+          </div>
+          <label class="dense-label">Perspective<input bind:value={importPerspective} /></label>
+          <div class="stream-entries">
+            {#each importStreams as stream}
+              <div class="stream-entry {stream.selected ? '' : 'stream-off'}">
+                <label class="stream-check-row">
+                  <input type="checkbox" bind:checked={stream.selected} />
+                  <span class="stream-kind-tag {stream.kind}">{stream.kind.charAt(0).toUpperCase()}</span>
+                  <span class="stream-idx muted">#{stream.index}</span>
+                  <span class="stream-details muted">{streamDetails(stream)}</span>
+                </label>
+                {#if stream.selected}
+                  <input class="stream-input" bind:value={stream.track} placeholder="Track" />
+                  <input class="stream-input" bind:value={stream.displayName} placeholder="Clip name" />
+                {/if}
+              </div>
+            {/each}
+          </div>
+          <button class="btn-primary full" onclick={addSelectedStreams}>
+            Add {importStreams.filter(s=>s.selected).length} stream{importStreams.filter(s=>s.selected).length !== 1 ? 's' : ''} @ {format(wallclockMs)}
+          </button>
+          {#if importError}<p class="error">{importError}</p>{/if}
+        </div>
+      {/if}
+
+      {#if error}
+        <div class="error-bar">
+          <span>{error}</span>
+          <button class="topbar-icon-btn" onclick={() => error = ''}>×</button>
+        </div>
+      {/if}
+    </aside>
+
+    <!-- CENTER: Monitor + Timeline -->
+    <section class="workspace">
+
+      <!-- Monitor -->
+      <section class="monitor-section">
+        <div class="monitor-head">
+          <span class="panel-label">Program monitor</span>
+          <div class="grid-btns">
+            {#each ['1x1','1x2','2x2','2x3'] as p}
+              <button class="grid-btn {gridPreset === p ? 'grid-active' : ''}" onclick={() => { gridPreset = p; persistPrefs(); }}>{p}</button>
+            {/each}
+          </div>
+          {#if !started}
+            <button class="start-review-btn" onclick={startSession}>▶ Start / unlock audio</button>
+          {/if}
+        </div>
+        <div class="video-grid preset-{gridPreset}">
+          {#each monitorCells as cell (cell.trackId)}
+            <div class="monitor-cell">
+              <video muted playsinline preload="auto" use:setTrackMedia={cell.trackId} use:fitVideoToCell></video>
+              {#if cell.activeClip}
+                {#if !cell.activeClip.hlsURL}
+                  <div class="cell-overlay status-overlay {clipStatus(cell.activeClip)}">{statusText(cell.activeClip)}</div>
+                {/if}
+                <button class="cell-label-btn" title="{cell.perspectiveName} / {cell.trackName}" onclick={() => { selectedClipId = cell.activeClip.clipId; activeInspectorTab = 'clip'; }}>
+                  <span class="cell-persp">{cell.perspectiveName}</span>
+                  <span class="cell-sep">/</span>
+                  <span class="cell-track">{cell.trackName}</span>
+                </button>
+              {:else}
+                <div class="cell-overlay gap-overlay">Gap — {cell.perspectiveName}</div>
+                <button class="cell-label-btn" title="{cell.perspectiveName} / {cell.trackName}">
+                  <span class="cell-persp">{cell.perspectiveName}</span>
+                  <span class="cell-sep">/</span>
+                  <span class="cell-track">{cell.trackName}</span>
+                </button>
+              {/if}
+            </div>
+          {:else}
+            <div class="empty-monitor">Enable a video track in the timeline header.</div>
+          {/each}
+        </div>
+      </section>
+
+      <!-- Timeline -->
+      <section class="timeline-section">
+        <div class="timeline-toolbar">
+          <div class="tbar-l">
+            <button class="tbar-play-btn {playing ? 'tbar-pause' : 'tbar-play'}" onclick={togglePlay}>{playing ? 'Pause' : 'Play'}</button>
+            <button class="tbar-tool-btn" onclick={addMarker} title="Marker (M)">
+              <svg width="10" height="10" viewBox="0 0 10 10"><path d="M5 1L6.5 4h3l-2.5 2 1 3L5 7l-3 3 1-3L.5 4h3z" fill="#f6c85f"/></svg>Marker
+            </button>
+            <button class="tbar-tool-btn" onclick={addRegion} title="Region (R)">
+              <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="3" width="9" height="4" rx="1" stroke="#8f70ff" stroke-width="1.2" fill="rgba(143,112,255,.2)"/></svg>Region
+            </button>
+            <div class="tbar-sep"></div>
+            <button class="tbar-tool-btn {showIngestPanel ? 'tbar-active' : ''}" onclick={() => { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }}>
+              Jobs {pendingJobCount > 0 ? `(${pendingJobCount})` : ''}{failedJobCount > 0 ? ` ⚠${failedJobCount}` : ''}
+            </button>
+          </div>
+          <div class="tbar-r">
+            <span class="tbar-hint">Drag ruler = scrub · Drag clip = align · M/R = add annotation · ? = help</span>
+          </div>
+        </div>
+
+        <div class="timeline-body">
+          <!-- Fixed label rail -->
+          <div class="label-rail">
+            <div class="label-corner"></div>
+            {#each trackRows as row}
+              {#if row.type === 'perspective'}
+                <div class="label-persp-row">
+                  <div class="persp-controls">
+                    <div class="persp-order">
+                      <button class="mini-btn" onclick={(e) => { e.stopPropagation(); moveInOrder('perspective', row.id, -1); }}>▲</button>
+                      <button class="mini-btn" onclick={(e) => { e.stopPropagation(); moveInOrder('perspective', row.id, 1); }}>▼</button>
+                    </div>
+                    <button class="collapse-btn" onclick={() => togglePerspectiveCollapse(row.id)}>{row.group.collapsed ? '▸' : '▾'}</button>
+                    <button class="persp-name-btn" title="Dbl-click to rename" ondblclick={() => startRename('perspective', row.id, row.perspectiveName)}>{row.perspectiveName}</button>
+                    <div class="persp-toggles">
+                      <button class="toggle-btn {groupViewEnabled(row.group) ? 'tog-v-on' : ''}" title="Show/hide in grid" onclick={() => togglePerspectiveView(row.group)}>V</button>
+                      <button class="toggle-btn {groupAudioEnabled(row.group) ? 'tog-a-on' : ''}" title="Enable/disable audio" onclick={() => togglePerspectiveAudio(row.group)}>A</button>
+                    </div>
+                  </div>
+                </div>
+              {:else if row.type === 'collapsed'}
+                <div class="label-track-row label-collapsed">
+                  <div class="track-head-inner">
+                    <span class="track-label-name">{row.perspectiveName}</span>
+                    <span class="track-label-sub muted">collapsed</span>
+                  </div>
+                </div>
+              {:else}
+                <div class="label-track-row label-{row.kind}">
+                  <div class="track-head-inner">
+                    <div class="track-order-btns">
+                      <button class="mini-btn" onclick={(e) => { e.stopPropagation(); moveInOrder('track', row.id, -1, row.perspectiveName); }}>▲</button>
+                      <button class="mini-btn" onclick={(e) => { e.stopPropagation(); moveInOrder('track', row.id, 1, row.perspectiveName); }}>▼</button>
+                    </div>
+                    <div class="track-names">
+                      <span class="track-label-name">{row.trackName}</span>
+                      <span class="track-label-sub muted">{row.perspectiveName}</span>
+                    </div>
+                    {#if row.kind === 'video'}
+                      <button class="toggle-btn {visibleTrackIds.includes(row.id) ? 'tog-v-on' : ''}" onclick={() => toggleTrack('video', row.id)} title="Show in grid">V</button>
+                    {:else}
+                      <button class="toggle-btn {activeAudioIds.includes(row.id) ? 'tog-a-on' : ''}" onclick={() => toggleTrack('audio', row.id)} title="Enable audio">A</button>
+                    {/if}
+                  </div>
+                </div>
+              {/if}
+            {/each}
+          </div>
+
+          <!-- Scrolling lanes -->
+          <div class="lane-scroll" bind:this={timelineViewport}>
+            <div class="lane-canvas" bind:this={timelineCanvas} style="width:{timelineWidthPx}px">
+              <!-- Ruler -->
+              <div class="ruler" onpointerdown={startPlayheadDrag}>
+                {#each tickMarks as tick}
+                  <div class="tick" style="left:{msToPx(tick)}px"><span>{format(tick)}</span></div>
+                {/each}
+                {#each markers as m}
+                  <button class="marker-pin" style={markerStyle(m)} title="{m.label} – {annotationAuthor(m)}" onpointerdown={(e) => openAnnotationEditor('marker', m, e)}>◆</button>
+                {/each}
+                {#each regions as r}
+                  <button class="region-band" style={regionStyle(r)} title="{r.label} – {annotationAuthor(r)}" onpointerdown={(e) => openAnnotationEditor('region', r, e)}></button>
+                {/each}
+              </div>
+              <div class="playhead" style="left:{msToPx(wallclockMs)}px" onpointerdown={startPlayheadDrag}><span></span></div>
+
+              <!-- Lanes -->
+              {#each trackRows as row}
+                {#if row.type === 'perspective'}
+                  <div class="lane-persp-row">
+                    <div class="persp-lane-inner">
+                      <span class="persp-lane-meta muted">{row.group.videoTracks.length}V · {row.group.audioTracks.length}A</span>
+                    </div>
+                  </div>
+                {:else if row.type === 'collapsed'}
+                  <div class="lane-track-row lane-collapsed">
+                    <div class="clip-lane" onpointerdown={startPlayheadDrag}>
+                      {#each row.clips as clip (clip.clipId)}
+                        <button class="clip-block {clip.kind} {clipStatus(clip)} clip-summary" class:clip-selected={selectedClipId === clip.clipId} title="{clip.displayName} · {clip.kind}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)} onclick={() => { selectedClipId = clip.clipId; persistPrefs(); }}>
+                          {#if clip.kind === 'audio'}<span class="waveform">{#each waveBars(clip) as h}<i style="height:{h}%"></i>{/each}</span>
+                          {:else}<span class="video-stripe"></span>{/if}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+                {:else}
+                  <div class="lane-track-row lane-{row.kind}">
+                    <div class="clip-lane" onpointerdown={startPlayheadDrag}>
+                      {#each row.clips as clip (clip.clipId)}
+                        {#if dragState?.clipId === clip.clipId}
+                          <div class="clip-block {clip.kind} clip-ghost" style={clipBlockStyle(clip, true)}><span class="clip-title">{clip.displayName}</span></div>
+                        {/if}
+                        <button class="clip-block {clip.kind} {clipStatus(clip)}" class:clip-selected={selectedClipId === clip.clipId} class:clip-dragging={dragState?.clipId === clip.clipId} title="{clip.displayName || clip.trackName}" style={clipBlockStyle(clip)} onpointerdown={(e) => startClipDrag(e, clip)} onclick={() => { selectedClipId = clip.clipId; persistPrefs(); activeInspectorTab = 'clip'; }}>
+                          <span class="clip-title">{clip.displayName || clip.trackName}</span>
+                          {#if clipStatus(clip) !== 'success'}<span class="clip-badge {clipStatus(clip)}">{statusText(clip)}</span>{/if}
+                          {#if clip.kind === 'audio'}<span class="waveform">{#each waveBars(clip) as h}<i style="height:{h}%"></i>{/each}</span>
+                          {:else}<span class="video-stripe"></span>{/if}
+                          <span class="clip-timecode">{format(clip.wallclockStartMs)} · {format(clip.durationMs)}</span>
+                          {#if isProjectOwner()}<span class="clip-del" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); deleteClip(clip); }}>×</span>{/if}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+              {:else}
+                <div class="empty-lane">Add footage from the left panel. Prepared review media is generated automatically.</div>
+              {/each}
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- RIGHT: Inspector -->
+    <aside class="right-panel">
+      <div class="inspector-tabs">
+        {#each [['clip','Clip'],['mixer','Mix'],['markers','Mkr'],['regions','Rgn'],['export','Export']] as [tab, label]}
+          <button class="ins-tab {activeInspectorTab === tab ? 'ins-tab-active' : ''}" onclick={() => activeInspectorTab = tab}>{label}</button>
+        {/each}
+      </div>
+
+      <div class="inspector-content">
+        {#if activeInspectorTab === 'clip'}
+          {#if selectedClip}
+            <div class="ins-section">
+              <div class="clip-inspect-title">
+                <span class="clip-kind-badge {selectedClip.kind}">{selectedClip.kind}</span>
+                <span class="clip-inspect-name">{selectedClip.displayName}</span>
+              </div>
+              <dl class="detail-list">
+                <dt>Track</dt><dd>{selectedClip.perspectiveName} / {selectedClip.trackName}</dd>
+                <dt>Stream</dt><dd>#{selectedClip.streamIndex}</dd>
+                <dt>Start</dt><dd>{format(selectedClip.wallclockStartMs)}</dd>
+                <dt>Duration</dt><dd>{format(selectedClip.durationMs)}</dd>
+                <dt>Status</dt>
+                <dd class="status-dd">
+                  <span class="inline-status {clipStatus(selectedClip)}">{clipStatus(selectedClip)}</span>
+                  {#if clipStatus(selectedClip) === 'failed'}
+                    <button class="btn-sm btn-warn-sm" onclick={() => retryClipIngest(selectedClip.clipId)}>Retry</button>
+                  {/if}
+                </dd>
+              </dl>
+            </div>
+
+            <div class="ins-section">
+              <p class="ins-section-label">Timeline align {isProjectOwner() ? '' : '(owner only)'}</p>
+              <div class="nudge-grid">
+                <button class="nudge-btn" onclick={() => moveClip(selectedClip, -1000)} disabled={!isProjectOwner()}>−1s</button>
+                <button class="nudge-btn" onclick={() => moveClip(selectedClip, -100)} disabled={!isProjectOwner()}>−100ms</button>
+                <button class="nudge-btn" onclick={() => moveClip(selectedClip, 100)} disabled={!isProjectOwner()}>+100ms</button>
+                <button class="nudge-btn" onclick={() => moveClip(selectedClip, 1000)} disabled={!isProjectOwner()}>+1s</button>
+              </div>
+            </div>
+
+            <div class="ins-section">
+              <p class="ins-section-label">Soft A/V nudge (local only, not saved to server)</p>
+              <div class="soft-nudge-row">
+                <button class="nudge-btn" onclick={() => setSoftNudge(selectedClip.clipId, (softNudges[selectedClip.clipId] || 0) - 50)}>−50ms</button>
+                <span class="soft-val">{softNudges[selectedClip.clipId] || 0}ms</span>
+                <button class="nudge-btn" onclick={() => setSoftNudge(selectedClip.clipId, (softNudges[selectedClip.clipId] || 0) + 50)}>+50ms</button>
+                <button class="btn-sm-ghost" onclick={() => setSoftNudge(selectedClip.clipId, 0)}>Reset</button>
+              </div>
+            </div>
+
+            <div class="ins-section ins-actions">
+              <button class="action-btn" onclick={renameSelectedClip} disabled={!isProjectOwner()}>Rename…</button>
+              <button class="action-btn action-danger" onclick={() => deleteClip(selectedClip)} disabled={!isProjectOwner()}>Delete clip</button>
+            </div>
+          {:else}
+            <p class="muted padded">Select a clip in the timeline.</p>
+          {/if}
+
+        {:else if activeInspectorTab === 'mixer'}
+          <div class="ins-section">
+            <p class="ins-section-label">Audio mixer</p>
             {#each audioClips as clip}
-              <div class="mixer-row">
-                <label class="checkline mixer-label"><input type="checkbox" checked={activeAudioIds.includes(clip.trackId)} onchange={() => toggleTrack('audio', clip.trackId)}><span title={`${clip.perspectiveName} / ${clip.trackName}`}>{clip.perspectiveName} / {clip.trackName}</span></label>
-                <input type="range" min="0" max="1" step="0.05" value={volumes[clip.clipId] ?? 0.85} oninput={(event) => setVolume(clip, event.currentTarget.value)}>
+              <div class="mixer-entry">
+                <label class="mixer-check-row">
+                  <input type="checkbox" checked={activeAudioIds.includes(clip.trackId)} onchange={() => toggleTrack('audio', clip.trackId)} />
+                  <span class="mixer-name" title="{clip.perspectiveName} / {clip.trackName}">{clip.perspectiveName} / {clip.trackName}</span>
+                </label>
+                <div class="mixer-vol-row">
+                  <input type="range" min="0" max="1" step="0.05" value={volumes[clip.clipId] ?? 0.85} oninput={(e) => setVolume(clip, e.currentTarget.value)} />
+                  <span class="vol-pct">{Math.round((volumes[clip.clipId] ?? 0.85) * 100)}%</span>
+                </div>
               </div>
             {:else}
-              <p class="muted">No audio tracks prepared yet.</p>
+              <p class="muted">No audio tracks prepared.</p>
             {/each}
           </div>
-        </section>
 
-        <section class="inspect-card annotation-card">
-          <h3>Markers</h3>
-          <div class="annotation-list">
-            {#each markers as marker}
-              <div class="marker-row annotation-row" title={`By ${annotationAuthor(marker)}`}>
-                <span style={`color:${markerColor(marker)}`}>●</span>
-                <button class="linkish" onclick={(event) => openAnnotationEditor('marker', marker, event)}>{format(marker.marker_ts_ms)}</button>
-                <span class="annotation-main"><span class="annotation-label">{marker.label}</span><span class="annotation-author">by {annotationAuthor(marker)}</span></span>
-                <button class="secondary" onclick={() => deleteMarker(marker.id)} disabled={!canEditAnnotation(marker)} title={canEditAnnotation(marker) ? 'Delete marker' : readOnlyAnnotationMessage()}>×</button>
+        {:else if activeInspectorTab === 'markers'}
+          <div class="ann-toolbar">
+            <button class="tbar-tool-btn" onclick={addMarker}>+ Marker @ {format(wallclockMs)}</button>
+          </div>
+          {#each markers as m}
+            <div class="ann-row">
+              <span class="ann-dot" style="background:{markerColor(m)}"></span>
+              <button class="ann-time-btn" onclick={(e) => { wallclockMs = Number(m.marker_ts_ms); seekAll(); openAnnotationEditor('marker', m, e); }}>{format(m.marker_ts_ms)}</button>
+              <div class="ann-text">
+                <span class="ann-label">{m.label || '—'}</span>
+                <span class="ann-author muted">{annotationAuthor(m)}</span>
               </div>
-            {:else}
-              <p class="muted">Press M or click Marker.</p>
-            {/each}
-          </div>
-        </section>
+              {#if canEditAnnotation(m)}
+                <button class="topbar-icon-btn" onclick={() => deleteMarker(m.id)}>×</button>
+              {/if}
+            </div>
+          {:else}
+            <p class="muted padded">Press M to add a marker at the playhead.</p>
+          {/each}
 
-        <section class="inspect-card annotation-card">
-          <h3>Regions</h3>
-          <div class="annotation-list">
-            {#each regions as region}
-              <div class="marker-row annotation-row" title={`By ${annotationAuthor(region)}`}>
-                <span style={`color:${regionColor(region)}`}>■</span>
-                <button class="linkish" onclick={(event) => openAnnotationEditor('region', region, event)}>{format(region.region_start_ms)}</button>
-                <span class="annotation-main"><span class="annotation-label">{region.label}</span><span class="annotation-author">by {annotationAuthor(region)}</span></span>
+        {:else if activeInspectorTab === 'regions'}
+          <div class="ann-toolbar">
+            <button class="tbar-tool-btn" onclick={addRegion}>+ Region @ {format(wallclockMs)}</button>
+          </div>
+          {#each regions as r}
+            <div class="ann-row">
+              <span class="ann-dot" style="background:{regionColor(r)};border-radius:2px"></span>
+              <button class="ann-time-btn" onclick={(e) => { wallclockMs = Number(r.region_start_ms); seekAll(); openAnnotationEditor('region', r, e); }}>{format(r.region_start_ms)}</button>
+              <div class="ann-text">
+                <span class="ann-label">{r.label || '—'}</span>
+                <span class="ann-author muted">{format(r.region_end_ms - r.region_start_ms)} · {annotationAuthor(r)}</span>
               </div>
-            {:else}
-              <p class="muted">Click 5s Region to add a region.</p>
-            {/each}
-          </div>
-        </section>
+              {#if canEditAnnotation(r)}
+                <button class="topbar-icon-btn" onclick={() => deleteRegion(r.id)}>×</button>
+              {/if}
+            </div>
+          {:else}
+            <p class="muted padded">Press R to add a region at the playhead.</p>
+          {/each}
 
-        <section class="inspect-card export-list">
-          <h3>Export</h3>
-          <a href={`/api/projects/${current.id}/export.csv`}>CSV</a>
-          <a href={`/api/projects/${current.id}/export.md`}>Markdown</a>
-          <a href={`/api/projects/${current.id}/export.json`}>JSON</a>
-          <a href={`/api/projects/${current.id}/export.edl`}>EDL</a>
-        </section>
-      </aside>
-    {:else}
-      <section class="empty-project panel"><h1>Select or create a project</h1><p class="muted">Then add footage from a local source folder.</p></section>
-    {/if}
-  </main>
+        {:else if activeInspectorTab === 'export'}
+          <div class="ins-section">
+            <p class="ins-section-label">Download annotations</p>
+            <div class="export-links">
+              <a class="export-link" href="/api/projects/{current.id}/export.csv" download>CSV</a>
+              <a class="export-link" href="/api/projects/{current.id}/export.md" download>Markdown</a>
+              <a class="export-link" href="/api/projects/{current.id}/export.json" download>JSON</a>
+              <a class="export-link" href="/api/projects/{current.id}/export.edl" download>EDL</a>
+            </div>
+          </div>
+          <div class="ins-section">
+            <p class="ins-section-label">Maintenance</p>
+            <button class="action-btn" onclick={ingest}>Retry all pending / failed</button>
+            <button class="action-btn" onclick={refreshProject}>Refresh project</button>
+          </div>
+        {/if}
+      </div>
+    </aside>
+
+  </div>
+
+  {:else}
+  <div class="no-project-screen">
+    <button class="no-proj-open-btn" onclick={() => showProjectPicker = true}>Open a project to begin</button>
+  </div>
+  {/if}
+
+  <!-- Hidden audio elements -->
+  <div class="audio-deck" aria-hidden="true">
+    {#each audioClips as clip (clip.clipId)}
+      {#if clip.hlsURL}
+        <audio preload="auto" use:setMedia={clip.clipId}></audio>
+      {/if}
+    {/each}
+  </div>
+
+</main>
 {/if}
