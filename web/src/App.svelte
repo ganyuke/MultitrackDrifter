@@ -17,6 +17,10 @@
   let editingProjectName = '';
   let editingProjectDesc = '';
   let showProjectEdit = false;
+  let members = [];
+  let newMemberUsername = '';
+  let newMemberRole = 'editor';
+  let memberMessage = '';
 
   let manifest = { clips: [] };
   let wallclockMs = 0;
@@ -149,6 +153,7 @@
     reconcileOrdering();
     markers = await api(`/api/projects/${id}/markers`);
     regions = await api(`/api/projects/${id}/regions`);
+    await refreshMembers();
     const prefs = loadPrefs(id);
     gridPreset = prefs.gridPreset || '2x2';
     perspectiveOrder = prefs.perspectiveOrder || [];
@@ -164,7 +169,8 @@
     volumes = prefs.volumes || {};
     selectedClipId = prefs.selectedClipId || null;
     connectWS(id);
-    await browseSources('');
+    if (canAnnotateProject()) await browseSources('');
+    else sources = [];
     await refreshIngestJobs();
     await tick();
     attachAll();
@@ -178,6 +184,7 @@
     reconcileOrdering();
     markers = await api(`/api/projects/${id}/markers`);
     regions = await api(`/api/projects/${id}/regions`);
+    await refreshMembers();
     await tick();
     attachAll();
   }
@@ -199,6 +206,17 @@
         presenceUsers = presenceUsers.filter(p => p.username !== msg.payload?.username);
       } else if (msg.type === 'clip.ingest.progress') {
         applyJobProgress(msg.payload || {});
+      } else if (msg.type?.startsWith('project.member.')) {
+        try {
+          await refreshMembers();
+          if (!canAnnotateProject()) { sources = []; importProbe = null; importStreams = []; }
+          await loadProjects();
+        } catch (e) {
+          current = null; manifest = { clips: [] }; markers = []; regions = []; members = []; sources = [];
+          if (ws) ws.close();
+          setError('Your access to this project changed.');
+          await loadProjects();
+        }
       } else if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) {
         await refreshProject();
         if (msg.type?.startsWith('clip.') || msg.type?.startsWith('ingest.')) await refreshIngestJobs();
@@ -207,7 +225,7 @@
   }
 
   async function browseSources(prefix) {
-    if (!current) return;
+    if (!current || !canAnnotateProject()) return;
     sourcePrefix = prefix;
     sources = await api(`/api/projects/${current.id}/sources?prefix=${encodeURIComponent(prefix)}&delimiter=/`);
   }
@@ -250,6 +268,52 @@
     ingestJobs = await api(`/api/projects/${current.id}/ingest-jobs`);
   }
 
+  async function refreshMembers() {
+    if (!current) { members = []; return; }
+    members = await api(`/api/projects/${current.id}/members`);
+  }
+
+  async function addProjectMember() {
+    if (!current || !isProjectOwner()) return;
+    const usernameToAdd = newMemberUsername.trim();
+    if (!usernameToAdd) { memberMessage = 'Enter a username.'; return; }
+    memberMessage = 'Adding…';
+    try {
+      await postJSON(`/api/projects/${current.id}/members`, { username: usernameToAdd, role: newMemberRole });
+      newMemberUsername = '';
+      newMemberRole = 'editor';
+      memberMessage = 'Added';
+      await refreshMembers();
+    } catch (e) {
+      memberMessage = e.message;
+    }
+  }
+
+  async function updateProjectMemberRole(member, role) {
+    if (!current || !isProjectOwner() || member.role === 'owner') return;
+    memberMessage = 'Saving…';
+    try {
+      await patchJSON(`/api/projects/${current.id}/members/${encodeURIComponent(member.username)}`, { role });
+      memberMessage = 'Saved';
+      await refreshMembers();
+    } catch (e) {
+      memberMessage = e.message;
+    }
+  }
+
+  async function removeProjectMember(member) {
+    if (!current || !isProjectOwner() || member.role === 'owner') return;
+    if (!confirm(`Remove ${member.displayName || member.username} from this project?`)) return;
+    memberMessage = 'Removing…';
+    try {
+      await del(`/api/projects/${current.id}/members/${encodeURIComponent(member.username)}`);
+      memberMessage = 'Removed';
+      await refreshMembers();
+    } catch (e) {
+      memberMessage = e.message;
+    }
+  }
+
   function applyJobProgress(payload) {
     const jobId = Number(payload.jobId || payload.job_id || 0);
     if (!jobId) return;
@@ -280,8 +344,14 @@
     await refreshIngestJobs();
   }
 
-  async function addMarker() { await postJSON(`/api/projects/${current.id}/markers`, { tsMs: wallclockMs, label: 'Marker', note: '' }); }
-  async function addRegion() { await postJSON(`/api/projects/${current.id}/regions`, { startMs: wallclockMs, endMs: wallclockMs + 5000, label: 'Region', note: '' }); }
+  async function addMarker() {
+    if (!canAnnotateProject()) { setError(projectEditorMessage()); return; }
+    await postJSON(`/api/projects/${current.id}/markers`, { tsMs: wallclockMs, label: 'Marker', note: '' });
+  }
+  async function addRegion() {
+    if (!canAnnotateProject()) { setError(projectEditorMessage()); return; }
+    await postJSON(`/api/projects/${current.id}/regions`, { startMs: wallclockMs, endMs: wallclockMs + 5000, label: 'Region', note: '' });
+  }
 
   async function deleteMarker(id) {
     const m = markers.find(m => String(m.id) === String(id));
@@ -798,11 +868,18 @@
   function regionColor(r) { return r.author_color || r.authorColor || r.color || me?.color || '#8f70ff'; }
   function withAlpha(c, a) { return /^#[0-9a-fA-F]{6}$/.test(c) ? `${c}${a}` : c; }
   function isProjectOwner() { return !!(current && me && current.ownerUsername === me.username); }
+  function myProjectRole() {
+    if (!current || !me) return '';
+    if (isProjectOwner()) return 'owner';
+    return members.find(m => m.username === me.username)?.role || '';
+  }
+  function canAnnotateProject() { return ['owner','editor','member'].includes(myProjectRole()); }
   function annotationAuthor(item) { return item?.author_username || item?.authorUsername || item?.author || 'unknown'; }
   function canEditAnnotation(item) { return !!(item && me && (annotationAuthor(item) === me.username || isProjectOwner())); }
   function annotationEditorCanEdit() { return !!(annotationEditor && me && (annotationEditor.author === me.username || isProjectOwner())); }
   function readOnlyAnnotationMessage() { return 'Read-only: only the author or project owner can edit.'; }
   function projectOwnerMessage() { return 'Only the project owner can do this.'; }
+  function projectEditorMessage() { return 'Ask the project owner to add you as an editor before marking up this project.'; }
   function perspectiveKey(item) { return item.perspectiveName || item.perspective || 'Default'; }
   function streamDetails(s) { return s.kind === 'video' ? `${s.codec||'video'} ${s.width||'?'}×${s.height||'?'}` : `${s.codec||'audio'} ${s.channels||'?'}ch`.trim(); }
   function waveBars(clip) {
@@ -1316,7 +1393,7 @@
     <!-- RIGHT: Inspector -->
     <aside class="right-panel">
       <div class="inspector-tabs">
-        {#each [['clip','Clip'],['mixer','Mix'],['markers','Mkr'],['regions','Rgn'],['export','Export']] as [tab, label]}
+        {#each [['clip','Clip'],['mixer','Mix'],['markers','Mkr'],['regions','Rgn'],['export','Export'],['members','People']] as [tab, label]}
           <button class="ins-tab {activeInspectorTab === tab ? 'ins-tab-active' : ''}" onclick={() => activeInspectorTab = tab}>{label}</button>
         {/each}
       </div>
@@ -1393,8 +1470,9 @@
 
         {:else if activeInspectorTab === 'markers'}
           <div class="ann-toolbar">
-            <button class="tbar-tool-btn" onclick={addMarker}>+ Marker @ {format(wallclockMs)}</button>
+            <button class="tbar-tool-btn" onclick={addMarker} disabled={!canAnnotateProject()}>+ Marker @ {format(wallclockMs)}</button>
           </div>
+          {#if !canAnnotateProject()}<p class="muted padded">You can view this project, but only editors can add markers.</p>{/if}
           {#each markers as m}
             <div class="ann-row">
               <span class="ann-dot" style="background:{markerColor(m)}"></span>
@@ -1413,8 +1491,9 @@
 
         {:else if activeInspectorTab === 'regions'}
           <div class="ann-toolbar">
-            <button class="tbar-tool-btn" onclick={addRegion}>+ Region @ {format(wallclockMs)}</button>
+            <button class="tbar-tool-btn" onclick={addRegion} disabled={!canAnnotateProject()}>+ Region @ {format(wallclockMs)}</button>
           </div>
+          {#if !canAnnotateProject()}<p class="muted padded">You can view this project, but only editors can add regions.</p>{/if}
           {#each regions as r}
             <div class="ann-row">
               <span class="ann-dot" style="background:{regionColor(r)};border-radius:2px"></span>
@@ -1445,6 +1524,48 @@
             <p class="ins-section-label">Maintenance</p>
             <button class="action-btn" onclick={ingest}>Retry all pending / failed</button>
             <button class="action-btn" onclick={refreshProject}>Refresh project</button>
+          </div>
+
+        {:else if activeInspectorTab === 'members'}
+          <div class="ins-section">
+            <p class="ins-section-label">Project access</p>
+            {#if isProjectOwner()}
+              <div class="member-add-row">
+                <input bind:value={newMemberUsername} placeholder="LDAP username" onkeydown={(e) => { if (e.key === 'Enter') addProjectMember(); }} />
+                <select bind:value={newMemberRole}>
+                  <option value="editor">Editor</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+                <button class="btn-sm" onclick={addProjectMember}>Add</button>
+              </div>
+              <p class="member-hint muted">Editors can add markers and regions. Viewers can only watch and export. Users must sign in once before they can be added.</p>
+              {#if memberMessage}<p class="member-message">{memberMessage}</p>{/if}
+            {:else}
+              <p class="member-hint muted">Your role: <strong>{myProjectRole() || 'viewer'}</strong>. Ask the owner to change access.</p>
+            {/if}
+          </div>
+
+          <div class="member-list">
+            {#each members as member}
+              <div class="member-row">
+                <span class="member-avatar" style="background:{member.color}">{member.username[0]?.toUpperCase()}</span>
+                <div class="member-main">
+                  <span class="member-name">{member.displayName || member.username}</span>
+                  <span class="member-user muted">{member.username}</span>
+                </div>
+                {#if isProjectOwner() && member.role !== 'owner'}
+                  <select class="member-role-select" value={member.role === 'member' ? 'editor' : member.role} onchange={(e) => updateProjectMemberRole(member, e.currentTarget.value)}>
+                    <option value="editor">Editor</option>
+                    <option value="viewer">Viewer</option>
+                  </select>
+                  <button class="topbar-icon-btn" title="Remove" onclick={() => removeProjectMember(member)}>×</button>
+                {:else}
+                  <span class="role-pill {member.role}">{member.role === 'member' ? 'editor' : member.role}</span>
+                {/if}
+              </div>
+            {:else}
+              <p class="muted padded">No members yet.</p>
+            {/each}
           </div>
         {/if}
       </div>

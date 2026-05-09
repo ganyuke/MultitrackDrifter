@@ -65,6 +65,10 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/projects", s.auth.Middleware(http.HandlerFunc(s.createProject)))
 	mux.Handle("GET /api/projects/{projectID}", s.auth.Middleware(http.HandlerFunc(s.getProject)))
 	mux.Handle("PATCH /api/projects/{projectID}", s.auth.Middleware(http.HandlerFunc(s.patchProject)))
+	mux.Handle("GET /api/projects/{projectID}/members", s.auth.Middleware(http.HandlerFunc(s.listProjectMembers)))
+	mux.Handle("POST /api/projects/{projectID}/members", s.auth.Middleware(http.HandlerFunc(s.addProjectMember)))
+	mux.Handle("PATCH /api/projects/{projectID}/members/{username}", s.auth.Middleware(http.HandlerFunc(s.patchProjectMember)))
+	mux.Handle("DELETE /api/projects/{projectID}/members/{username}", s.auth.Middleware(http.HandlerFunc(s.deleteProjectMember)))
 	mux.Handle("GET /api/projects/{projectID}/sources", s.auth.Middleware(http.HandlerFunc(s.listSources)))
 	mux.Handle("GET /api/projects/{projectID}/sources/probe", s.auth.Middleware(http.HandlerFunc(s.probeSource)))
 	mux.Handle("POST /api/projects/{projectID}/assets", s.auth.Middleware(http.HandlerFunc(s.createAssetClip)))
@@ -149,7 +153,13 @@ func (s *Server) setColor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id, name, description, owner_username, created_at, updated_at FROM projects ORDER BY updated_at DESC`)
+	p, _ := auth.FromContext(r.Context())
+	rows, err := s.db.QueryContext(r.Context(), `
+SELECT DISTINCT p.id, p.name, p.description, p.owner_username, p.created_at, p.updated_at
+FROM projects p
+LEFT JOIN project_memberships pm ON pm.project_id=p.id AND pm.username=?
+WHERE p.owner_username=? OR pm.role IN ('owner','editor','member','viewer')
+ORDER BY p.updated_at DESC`, p.Username, p.Username)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -208,6 +218,9 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
 	var project map[string]any
 	row := s.db.QueryRowContext(r.Context(), `SELECT id, name, description, owner_username FROM projects WHERE id=?`, projectID)
 	var id int64
@@ -245,6 +258,13 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := pathID(w, r, "projectID")
+	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
+		return
+	}
 	prefix := r.URL.Query().Get("prefix")
 	delimiter := r.URL.Query().Get("delimiter")
 	if delimiter == "" {
@@ -761,6 +781,9 @@ func (s *Server) listIngestJobs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
 	rows := s.queryRows(r.Context(), `
 SELECT j.id, j.clip_id, COALESCE(c.display_name, '') AS clip_name, j.state, j.stage, j.error,
        j.progress_pct, j.progress_time_ms, j.total_duration_ms,
@@ -952,6 +975,9 @@ func (s *Server) playbackManifest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
 	etag, lastModified := s.playbackManifestValidator(r.Context(), projectID)
 	if etag != "" {
 		w.Header().Set("etag", etag)
@@ -1064,6 +1090,9 @@ func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
 	writeJSON(w, 200, s.queryRows(r.Context(), `SELECT id, marker_ts_ms, author_username, author_color, author_color AS authorColor, label, COALESCE(note,'') AS note, created_at, updated_at FROM markers WHERE project_id=? ORDER BY marker_ts_ms`, projectID))
 }
 
@@ -1157,6 +1186,9 @@ func (s *Server) deleteMarker(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listRegions(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
+		return
+	}
+	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
 	writeJSON(w, 200, s.queryRows(r.Context(), `SELECT id, region_start_ms, region_end_ms, author_username, author_color, author_color AS authorColor, label, COALESCE(note,'') AS note, created_at, updated_at FROM regions WHERE project_id=? ORDER BY region_start_ms`, projectID))
@@ -1266,6 +1298,9 @@ func (s *Server) exportEDL(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireProjectMember(w, r, projectID) {
+		return
+	}
 	w.Header().Set("content-type", "text/plain")
 	w.Header().Set("content-disposition", `attachment; filename="regions.edl"`)
 	if err := exp.WriteEDL(r.Context(), s.db, w, projectID); err != nil {
@@ -1279,6 +1314,9 @@ type itemWriter func(io.Writer, []exp.Item) error
 func (s *Server) withItems(w http.ResponseWriter, r *http.Request, contentType, filename string, fn itemWriter) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
+		return
+	}
+	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
 	items, err := exp.Items(r.Context(), s.db, projectID)
@@ -1297,6 +1335,9 @@ func (s *Server) withItems(w http.ResponseWriter, r *http.Request, contentType, 
 func (s *Server) wsProject(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
+		return
+	}
+	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
 	p, _ := auth.FromContext(r.Context())

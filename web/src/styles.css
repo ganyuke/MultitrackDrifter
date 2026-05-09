@@ -404,3 +404,24 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .topbar { grid-template-columns:1fr 1fr; }
   .topbar-right { border-left:0; }
 }
+
+/* PROJECT MEMBERS */
+.member-add-row { display:grid; grid-template-columns:minmax(0,1fr) 74px 42px; gap:4px; align-items:center; }
+.member-add-row select,
+.member-role-select { height:26px; border:1px solid var(--line2); background:var(--bg2); color:var(--text); padding:0 5px; font-size:10px; }
+.member-hint { font-size:10px; line-height:1.35; }
+.member-hint strong { color:var(--text); font-weight:700; }
+.member-message { font-size:10px; color:var(--yellow); overflow-wrap:anywhere; }
+.member-list { display:grid; }
+.member-row { display:flex; align-items:center; gap:6px; min-height:34px; padding:5px 6px; border-bottom:1px solid var(--line); overflow:hidden; }
+.member-avatar { width:18px; height:18px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; color:#fff; font-size:10px; font-weight:800; }
+.member-main { flex:1; min-width:0; display:grid; gap:1px; }
+.member-name { font-size:11px; font-weight:700; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.member-user { font-size:10px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.member-role-select { width:70px; flex-shrink:0; }
+.role-pill { height:18px; display:inline-flex; align-items:center; justify-content:center; min-width:48px; padding:0 6px; border:1px solid var(--line2); background:var(--raised); color:var(--muted); font-size:9px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; flex-shrink:0; }
+.role-pill.owner { border-color:var(--yellow-dk); background:#1c1608; color:var(--yellow); }
+.role-pill.editor,
+.role-pill.member { border-color:#1a4a30; background:#0c2018; color:var(--green); }
+.role-pill.viewer { border-color:var(--line2); background:var(--panel); color:var(--text2); }
+.tbar-tool-btn:disabled { opacity:.35; cursor:not-allowed; }
