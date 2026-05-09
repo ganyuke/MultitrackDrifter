@@ -242,7 +242,7 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .monitor-cell { position:relative; min-width:0; min-height:0; overflow:hidden; background:#020406; border:1px solid #12192a; display:grid; place-items:center; }
 .monitor-cell video { width:100%; height:100%; object-fit:contain; display:block; }
 .cell-overlay { position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
-.status-overlay.queued, .status-overlay.processing { background:rgba(0,0,0,.6); background-image:repeating-linear-gradient(135deg,rgba(246,200,95,.06) 0 8px,transparent 8px 16px); color:var(--yellow); }
+.status-overlay.pending, .status-overlay.queued, .status-overlay.processing { background:rgba(0,0,0,.6); background-image:repeating-linear-gradient(135deg,rgba(246,200,95,.06) 0 8px,transparent 8px 16px); color:var(--yellow); }
 .status-overlay.failed { background:rgba(0,0,0,.65); color:var(--red); }
 .gap-overlay { background:rgba(0,0,0,.5); color:var(--muted2); }
 .cell-label-btn { position:absolute; bottom:4px; left:4px; max-width:calc(100% - 8px); height:18px; display:flex; align-items:center; gap:3px; border:1px solid rgba(255,255,255,.12); background:rgba(0,0,0,.72); color:var(--text2); cursor:pointer; padding:0 5px; font-size:10px; overflow:hidden; z-index:3; white-space:nowrap; }
@@ -309,7 +309,7 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .clip-block { position:absolute; top:4px; height:32px; display:flex; flex-direction:column; overflow:hidden; border:1px solid rgba(255,255,255,.18); padding:2px 18px 2px 5px; color:#fff; cursor:grab; text-align:left; }
 .clip-block.video { background:var(--video-bg); border-color:var(--video-bd); }
 .clip-block.audio { background:var(--audio-bg); border-color:var(--audio-bd); }
-.clip-block.queued, .clip-block.processing { background:#302010; border-color:#806030; color:#ffe0a0; }
+.clip-block.pending, .clip-block.queued, .clip-block.processing { background:#302010; border-color:#806030; color:#ffe0a0; }
 .clip-block.failed { background:#300e12; border-color:#7a2830; color:#ffbbc0; }
 .clip-selected { outline:2px solid var(--yellow); outline-offset:-1px; z-index:5; }
 .clip-dragging { opacity:.88; z-index:10; cursor:grabbing; }
@@ -351,7 +351,7 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .inline-status.success { background:#0c2018; color:var(--green); border:1px solid #1a4030; }
 .inline-status.failed { background:var(--red-dk); color:#ffb0b0; border:1px solid #5a2028; }
 .inline-status.processing { background:#1a1808; color:var(--yellow); border:1px solid #3a3010; }
-.inline-status.queued { background:var(--raised); color:var(--muted); border:1px solid var(--line); }
+.inline-status.pending, .inline-status.queued { background:var(--raised); color:var(--muted); border:1px solid var(--line); }
 .nudge-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:3px; }
 .nudge-btn { height:22px; border:1px solid var(--line2); background:var(--raised); color:var(--text2); cursor:pointer; font-size:10px; font-family:ui-monospace,monospace; transition:all .1s; padding:0; }
 .nudge-btn:hover:not(:disabled) { background:var(--blue-bg); border-color:var(--blue); color:var(--blue); }
