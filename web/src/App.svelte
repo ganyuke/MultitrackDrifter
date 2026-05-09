@@ -566,24 +566,96 @@
     await refreshProject();
   }
 
+  function clipIdOf(clipOrId) {
+    const id = clipOrId?.clipId ?? clipOrId?.id ?? clipOrId;
+    return id === undefined || id === null || id === '' ? null : id;
+  }
+
+  function uniqueClipIds(ids) {
+    const seen = new Set();
+    const next = [];
+    for (const raw of ids || []) {
+      const id = clipIdOf(raw);
+      if (id === null) continue;
+      const key = String(id);
+      if (seen.has(key)) continue;
+      seen.add(key); next.push(id);
+    }
+    return next;
+  }
+
+  function clipDeleteLabel(ids) {
+    const unique = uniqueClipIds(ids);
+    if (unique.length === 1) {
+      const clip = allClips.find(c => String(c.clipId) === String(unique[0]));
+      return `"${clip?.displayName || 'selected clip'}"`;
+    }
+    return `${unique.length} selected clips`;
+  }
+
+  function removeDeletedClipsFromUI(ids) {
+    const doomed = new Set(uniqueClipIds(ids).map(String));
+    if (!doomed.size) return;
+    const removedClips = (manifest.clips || []).filter(c => doomed.has(String(c.clipId)));
+    for (const clip of removedClips) cleanupClipMedia(clip.clipId);
+    manifest = { ...manifest, clips: (manifest.clips || []).filter(c => !doomed.has(String(c.clipId))) };
+    selectedClipIds = selectedClipIds.filter(id => !doomed.has(String(id)));
+    if (selectedClipId && doomed.has(String(selectedClipId))) selectedClipId = selectedClipIds[0] || null;
+    reconcileOrdering();
+    reconcileSelection();
+    persistPrefs();
+  }
+
+  function isAlreadyDeletedError(error) {
+    return error?.status === 404 || /(^|\s)404(\s|$)/.test(error?.message || '');
+  }
+
+  async function deleteClipIds(ids) {
+    if (!current || !isProjectOwner()) return false;
+    const targetIds = uniqueClipIds(ids);
+    if (!targetIds.length) return false;
+
+    const results = await Promise.all(targetIds.map(async (id) => {
+      try {
+        await del(`/api/projects/${current.id}/clips/${id}`);
+        return { id, deleted: true };
+      } catch (error) {
+        if (isAlreadyDeletedError(error)) return { id, deleted: true, alreadyGone: true };
+        return { id, deleted: false, error };
+      }
+    }));
+
+    const deletedIds = results.filter(r => r.deleted).map(r => r.id);
+    const failed = results.filter(r => !r.deleted);
+    removeDeletedClipsFromUI(deletedIds);
+
+    try { await refreshProject(); }
+    catch (error) { if (!failed.length) setError(`Deleted clips, but refresh failed: ${error.message}`); }
+
+    if (failed.length) {
+      selectedClipIds = failed.map(r => r.id);
+      selectedClipId = selectedClipIds[0] || null;
+      persistPrefs();
+      const message = failed.length === 1 ? failed[0].error.message : `${failed.length} clips could not be deleted`;
+      setError(message);
+      return false;
+    }
+    return true;
+  }
+
   async function deleteClip(clip = selectedClip) {
-    if (!clip || !isProjectOwner()) return;
-    if (!confirm(`Remove "${clip.displayName || 'clip'}" from this project timeline?`)) return;
-    await del(`/api/projects/${current.id}/clips/${clip.clipId || clip.id}`);
-    selectedClipIds = selectedClipIds.filter(id => String(id) !== String(clip.clipId || clip.id));
-    if (String(selectedClipId) === String(clip.clipId || clip.id)) selectedClipId = selectedClipIds[0] || null;
-    await refreshProject();
+    const id = clipIdOf(clip);
+    if (!id || !isProjectOwner()) return;
+    const label = clip?.displayName || 'clip';
+    if (!confirm(`Remove "${label}" from this project timeline?`)) return;
+    await deleteClipIds([id]);
   }
 
   async function deleteSelectedClips() {
-    if (!selectedClips.length || !isProjectOwner()) return;
-    const count = selectedClips.length;
-    const label = count === 1 ? `"${selectedClips[0].displayName || 'clip'}"` : `${count} selected clips`;
-    if (!confirm(`Remove ${label} from this project timeline?`)) return;
-    for (const clip of selectedClips) await del(`/api/projects/${current.id}/clips/${clip.clipId}`);
-    selectedClipId = null;
-    selectedClipIds = [];
-    await refreshProject();
+    const ids = uniqueClipIds(selectedClipIds.length ? selectedClipIds : selectedClips.map(c => c.clipId));
+    if (!ids.length || !isProjectOwner()) return;
+    if (!confirm(`Remove ${clipDeleteLabel(ids)} from this project timeline?`)) return;
+    await deleteClipIds(ids);
   }
 
   async function detachSelectedClips() {
@@ -1062,7 +1134,7 @@
     if (event.key === 'j' || event.key === 'J') { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }
     if (event.key === 'ArrowLeft') { wallclockMs = Math.max(0, wallclockMs - (event.shiftKey ? 1000 : 100)); seekAll(); }
     if (event.key === 'ArrowRight') { wallclockMs += event.shiftKey ? 1000 : 100; seekAll(); }
-    if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClips.length) { event.preventDefault(); deleteSelectedClips(); }
+    if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClipIds.length) { event.preventDefault(); deleteSelectedClips(); }
     if (event.key === '?') showKeyboardHelp = !showKeyboardHelp;
   }
 

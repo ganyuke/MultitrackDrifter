@@ -1,13 +1,17 @@
 export async function api(path, options = {}) {
+  const { headers = {}, ...rest } = options;
   const res = await fetch(path, {
     credentials: 'include',
-    headers: { 'content-type': 'application/json', ...(options.headers || {}) },
-    ...options
+    cache: 'no-store',
+    ...rest,
+    headers: { 'content-type': 'application/json', ...headers }
   });
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`;
     try { message = (await res.json()).error || message; } catch (_) {}
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = res.status;
+    throw error;
   }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('json') ? res.json() : res.text();
