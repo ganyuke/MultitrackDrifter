@@ -80,6 +80,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PATCH /api/projects/{projectID}/perspectives/{perspectiveID}", s.auth.Middleware(http.HandlerFunc(s.patchPerspective)))
 	mux.Handle("POST /api/projects/{projectID}/tracks", s.auth.Middleware(http.HandlerFunc(s.createTrack)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.patchClips)))
+	mux.Handle("POST /api/projects/{projectID}/clips/delete", s.auth.Middleware(http.HandlerFunc(s.deleteClips)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.patchClip)))
 	mux.Handle("DELETE /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.deleteClip)))
 	mux.Handle("GET /api/projects/{projectID}/playback-manifest", s.auth.Middleware(http.HandlerFunc(s.playbackManifest)))
@@ -146,11 +147,19 @@ func (s *Server) setColor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err)
 		return
 	}
-	if err := s.auth.SetColor(r.Context(), p.Username, req.Color); err != nil {
+	color, ok := auth.CanonicalColor(req.Color)
+	if !ok {
+		writeError(w, 400, errors.New("color not in accessible palette"))
+		return
+	}
+	if err := s.auth.SetColor(r.Context(), p.Username, color); err != nil {
 		writeError(w, 400, err)
 		return
 	}
-	p.Color = req.Color
+	p.Color = color
+	if s.hub != nil {
+		s.hub.UpdateUserColor(p.Username, color)
+	}
 	writeJSON(w, 200, p)
 }
 
@@ -936,6 +945,7 @@ func (s *Server) patchClips(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = tx.Rollback() }()
 
 	updates := make([]map[string]any, 0, len(req.Updates))
+	missing := []int64{}
 	seen := map[int64]bool{}
 	for _, update := range req.Updates {
 		if update.ClipID <= 0 {
@@ -961,17 +971,23 @@ func (s *Server) patchClips(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rows == 0 {
-			writeError(w, 404, fmt.Errorf("clip %d not found", update.ClipID))
-			return
+			missing = append(missing, update.ClipID)
+			continue
 		}
 		updates = append(updates, map[string]any{"clipId": update.ClipID, "wallclockStartMs": start})
+	}
+	if len(updates) == 0 && len(missing) == 0 {
+		writeError(w, 400, errors.New("no valid clip updates were provided"))
+		return
 	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
 	}
-	s.broadcast(r, projectID, "clip.timeline.batch_updated", map[string]any{"updates": updates})
-	writeJSON(w, 200, map[string]any{"updates": updates})
+	if len(updates) > 0 {
+		s.broadcast(r, projectID, "clip.timeline.batch_updated", map[string]any{"updates": updates, "missingClipIds": missing})
+	}
+	writeJSON(w, 200, map[string]any{"updates": updates, "missingClipIds": missing})
 }
 
 func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
@@ -1022,6 +1038,76 @@ func (s *Server) patchClip(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+func (s *Server) deleteClips(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := pathID(w, r, "projectID")
+	if !ok {
+		return
+	}
+	if !s.requireProjectEditor(w, r, projectID) {
+		return
+	}
+	var req struct {
+		ClipIDs []int64 `json:"clipIds"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	if len(req.ClipIDs) == 0 {
+		writeError(w, 400, errors.New("at least one clip id is required"))
+		return
+	}
+
+	seen := map[int64]bool{}
+	ids := make([]int64, 0, len(req.ClipIDs))
+	for _, id := range req.ClipIDs {
+		if id <= 0 {
+			writeError(w, 400, errors.New("clipId must be positive"))
+			return
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	deleted := []int64{}
+	missing := []int64{}
+	for _, id := range ids {
+		res, err := tx.ExecContext(r.Context(), `DELETE FROM clips WHERE id=? AND project_id=?`, id, projectID)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		if rows == 0 {
+			missing = append(missing, id)
+			continue
+		}
+		deleted = append(deleted, id)
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	if len(deleted) > 0 {
+		s.broadcast(r, projectID, "clip.deleted.batch", map[string]any{"clipIds": deleted, "missingClipIds": missing})
+	}
+	writeJSON(w, 200, map[string]any{"deletedClipIds": deleted, "missingClipIds": missing})
+}
+
 func (s *Server) deleteClip(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -1054,17 +1140,6 @@ func (s *Server) playbackManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.requireProjectMember(w, r, projectID) {
 		return
-	}
-	etag, lastModified := s.playbackManifestValidator(r.Context(), projectID)
-	if etag != "" {
-		w.Header().Set("etag", etag)
-		if t, ok := parseSQLiteTime(lastModified); ok {
-			w.Header().Set("last-modified", t.UTC().Format(http.TimeFormat))
-		}
-		if strings.TrimSpace(r.Header.Get("if-none-match")) == etag {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
 	}
 	rows, err := s.db.QueryContext(r.Context(), `
 SELECT c.id, c.perspective_id, p.name, c.track_id, t.name, c.media_kind, c.wallclock_start_ms, c.duration_ms,
@@ -1170,7 +1245,16 @@ func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
 	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
-	writeJSON(w, 200, s.queryRows(r.Context(), `SELECT id, marker_ts_ms, author_username, author_color, author_color AS authorColor, label, COALESCE(note,'') AS note, created_at, updated_at FROM markers WHERE project_id=? ORDER BY marker_ts_ms`, projectID))
+	writeJSON(w, 200, s.queryRows(r.Context(), `
+SELECT m.id, m.marker_ts_ms, m.author_username, m.author_username AS author,
+       COALESCE(u.color, m.author_color) AS author_color,
+       COALESCE(u.color, m.author_color) AS authorColor,
+       COALESCE(u.color, m.author_color) AS color,
+       m.label, COALESCE(m.note,'') AS note, m.created_at, m.updated_at
+FROM markers m
+LEFT JOIN users u ON u.username=m.author_username
+WHERE m.project_id=?
+ORDER BY m.marker_ts_ms`, projectID))
 }
 
 func (s *Server) createMarker(w http.ResponseWriter, r *http.Request) {
@@ -1268,7 +1352,16 @@ func (s *Server) listRegions(w http.ResponseWriter, r *http.Request) {
 	if !s.requireProjectMember(w, r, projectID) {
 		return
 	}
-	writeJSON(w, 200, s.queryRows(r.Context(), `SELECT id, region_start_ms, region_end_ms, author_username, author_color, author_color AS authorColor, label, COALESCE(note,'') AS note, created_at, updated_at FROM regions WHERE project_id=? ORDER BY region_start_ms`, projectID))
+	writeJSON(w, 200, s.queryRows(r.Context(), `
+SELECT r.id, r.region_start_ms, r.region_end_ms, r.author_username, r.author_username AS author,
+       COALESCE(u.color, r.author_color) AS author_color,
+       COALESCE(u.color, r.author_color) AS authorColor,
+       COALESCE(u.color, r.author_color) AS color,
+       r.label, COALESCE(r.note,'') AS note, r.created_at, r.updated_at
+FROM regions r
+LEFT JOIN users u ON u.username=r.author_username
+WHERE r.project_id=?
+ORDER BY r.region_start_ms`, projectID))
 }
 
 func (s *Server) createRegion(w http.ResponseWriter, r *http.Request) {
@@ -1560,6 +1653,8 @@ func decodeJSON(r *http.Request, dst any) error {
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("content-type", "application/json")
+	w.Header().Set("cache-control", "no-store")
+	w.Header().Set("pragma", "no-cache")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

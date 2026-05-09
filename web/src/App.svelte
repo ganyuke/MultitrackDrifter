@@ -135,6 +135,7 @@
     try {
       error = '';
       me = await postJSON('/api/me/color', { color });
+      applyUserColor(me.username, me.color);
       showColorPicker = false;
     } catch (e) {
       setError(e.message || 'Could not update accent color', 4000);
@@ -204,6 +205,16 @@
     attachAll();
   }
 
+  function applyUserColor(username, color) {
+    if (!username || !color) return;
+    if (me?.username === username) me = { ...me, color };
+    presenceUsers = presenceUsers.map(u => u.username === username ? { ...u, color } : u);
+    members = members.map(m => m.username === username ? { ...m, color } : m);
+    markers = markers.map(m => annotationAuthor(m) === username ? { ...m, author_color: color, authorColor: color, color } : m);
+    regions = regions.map(r => annotationAuthor(r) === username ? { ...r, author_color: color, authorColor: color, color } : r);
+    if (annotationEditor?.author === username) annotationEditor = { ...annotationEditor, color };
+  }
+
   function connectWS(id) {
     if (ws) ws.close();
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -216,9 +227,17 @@
         presenceUsers = msg.payload?.users || [];
       } else if (msg.type === 'user.joined') {
         const u = msg.payload;
-        if (!presenceUsers.find(p => p.username === u.username)) presenceUsers = [...presenceUsers, u];
+        if (presenceUsers.find(p => p.username === u.username)) {
+          presenceUsers = presenceUsers.map(p => p.username === u.username ? { ...p, ...u } : p);
+        } else {
+          presenceUsers = [...presenceUsers, u];
+        }
       } else if (msg.type === 'user.left') {
         presenceUsers = presenceUsers.filter(p => p.username !== msg.payload?.username);
+      } else if (msg.type === 'user.color.updated') {
+        const username = msg.payload?.username || msg.user;
+        const color = msg.payload?.color || msg.color;
+        applyUserColor(username, color);
       } else if (msg.type === 'clip.ingest.progress') {
         applyJobProgress(msg.payload || {});
       } else if (msg.type?.startsWith('project.member.')) {
@@ -433,9 +452,10 @@
       .map(([id, start]) => [id, Math.max(0, Math.round(Number(start)))])
       .filter(([id, start]) => Number.isFinite(start) && allClips.some(c => String(c.clipId) === String(id) && Math.round(c.wallclockStartMs) !== start));
     if (!entries.length) return;
-    await patchJSON(`/api/projects/${current.id}/clips`, {
+    const result = await patchJSON(`/api/projects/${current.id}/clips`, {
       updates: entries.map(([clipId, wallclockStartMs]) => ({ clipId: Number(clipId), wallclockStartMs }))
     });
+    if (result?.missingClipIds?.length) removeDeletedClipsFromUI(result.missingClipIds);
     await refreshProject();
   }
 
@@ -557,6 +577,18 @@
     return next;
   }
 
+  function normalizeTrackIds(ids, validIds = null) {
+    const valid = validIds ? new Set(validIds.map(String)) : null;
+    const seen = new Set();
+    const next = [];
+    for (const id of ids || []) {
+      const key = String(id);
+      if (seen.has(key) || (valid && !valid.has(key))) continue;
+      seen.add(key); next.push(id);
+    }
+    return next;
+  }
+
   function setSoftNudge(clipId, ms) {
     softNudges = { ...softNudges, [clipId]: Number(ms) };
     persistPrefs();
@@ -620,32 +652,19 @@
     const targetIds = uniqueClipIds(ids);
     if (!targetIds.length) return false;
 
-    const results = await Promise.all(targetIds.map(async (id) => {
-      try {
-        await del(`/api/projects/${current.id}/clips/${id}`);
-        return { id, deleted: true };
-      } catch (error) {
-        if (isAlreadyDeletedError(error)) return { id, deleted: true, alreadyGone: true };
-        return { id, deleted: false, error };
-      }
-    }));
-
-    const deletedIds = results.filter(r => r.deleted).map(r => r.id);
-    const failed = results.filter(r => !r.deleted);
-    removeDeletedClipsFromUI(deletedIds);
-
-    try { await refreshProject(); }
-    catch (error) { if (!failed.length) setError(`Deleted clips, but refresh failed: ${error.message}`); }
-
-    if (failed.length) {
-      selectedClipIds = failed.map(r => r.id);
-      selectedClipId = selectedClipIds[0] || null;
-      persistPrefs();
-      const message = failed.length === 1 ? failed[0].error.message : `${failed.length} clips could not be deleted`;
-      setError(message);
+    try {
+      const result = await postJSON(`/api/projects/${current.id}/clips/delete`, {
+        clipIds: targetIds.map(id => Number(id)).filter(Number.isFinite)
+      });
+      const removed = uniqueClipIds([...(result?.deletedClipIds || []), ...(result?.missingClipIds || [])]);
+      removeDeletedClipsFromUI(removed);
+      await refreshProject();
+      return true;
+    } catch (error) {
+      setError(error.message || 'Could not delete selected clips');
+      try { await refreshProject(); } catch (_) {}
       return false;
     }
-    return true;
   }
 
   async function deleteClip(clip = selectedClip) {
@@ -852,7 +871,7 @@
     const list = listName === 'video' ? visibleTrackIds : activeAudioIds;
     const disabling = hasId(list, id);
     const next = disabling ? removeIds(list, [id]) : addIds(list, [id]);
-    if (listName === 'video') visibleTrackIds = next; else activeAudioIds = next;
+    if (listName === 'video') visibleTrackIds = normalizeTrackIds(next); else activeAudioIds = normalizeTrackIds(next);
     if (disabling) disableTrackMedia(id);
     persistPrefs();
     await tick(); attachAll(); seekAll();
@@ -1003,7 +1022,7 @@
       ids.forEach(disableTrackMedia);
     } else {
       const rem = (rememberedPerspectiveViewIds[id] || []).filter(t => hasId(ids, t));
-      visibleTrackIds = addIds(visibleTrackIds, rem.length ? rem : enabled.length ? enabled : ids);
+      visibleTrackIds = normalizeTrackIds(addIds(visibleTrackIds, rem.length ? rem : enabled.length ? enabled : ids));
       hiddenPerspectiveIds = hiddenPerspectiveIds.filter(v => v !== id);
     }
     persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
@@ -1021,7 +1040,7 @@
       ids.forEach(disableTrackMedia);
     } else {
       const rem = (rememberedPerspectiveAudioIds[group.id] || []).filter(id => hasId(ids, id));
-      activeAudioIds = addIds(activeAudioIds, rem.length ? rem : ids);
+      activeAudioIds = normalizeTrackIds(addIds(activeAudioIds, rem.length ? rem : ids));
     }
     persistPrefs(); await tick(); attachAll(); seekAll(); if (playing) await playActiveMedia();
   }
@@ -1054,8 +1073,8 @@
       return String(ca.trackName || '').localeCompare(String(cb.trackName || ''));
     });
     trackOrder = [...existing, ...fallback.filter(t => !existing.includes(t))];
-    visibleTrackIds = visibleTrackIds.filter(id => hasId(tKeys, id));
-    activeAudioIds = activeAudioIds.filter(id => hasId(tKeys, id));
+    visibleTrackIds = normalizeTrackIds(visibleTrackIds, tKeys);
+    activeAudioIds = normalizeTrackIds(activeAudioIds, tKeys);
     for (const id of tKeys) {
       const clip = trackById.get(id);
       if (!known.has(id) && clip?.kind === 'video' && !hasId(visibleTrackIds, id)) visibleTrackIds = addIds(visibleTrackIds, [id]);
@@ -1179,8 +1198,20 @@
     const c = regionColor(r);
     return `left:${msToPx(r.region_start_ms)}px;width:${Math.max(10, msToLanePx(r.region_end_ms - r.region_start_ms))}px;background:${withAlpha(c,'33')};border-color:${withAlpha(c,'aa')};`;
   }
-  function markerColor(m) { return m.author_color || m.authorColor || m.color || me?.color || '#f6c85f'; }
-  function regionColor(r) { return r.author_color || r.authorColor || r.color || me?.color || '#8f70ff'; }
+  function colorForUsername(username, fallback) {
+    if (username && me?.username === username && me.color) return me.color;
+    const member = members.find(m => m.username === username);
+    if (member?.color) return member.color;
+    const present = presenceUsers.find(u => u.username === username);
+    if (present?.color) return present.color;
+    return fallback;
+  }
+  function annotationColor(item, fallback) {
+    const stored = item?.author_color || item?.authorColor || item?.color || fallback;
+    return colorForUsername(annotationAuthor(item), stored);
+  }
+  function markerColor(m) { return annotationColor(m, '#f6c85f'); }
+  function regionColor(r) { return annotationColor(r, '#8f70ff'); }
   function withAlpha(c, a) { return /^#[0-9a-fA-F]{6}$/.test(c) ? `${c}${a}` : c; }
   function isProjectOwner() { return !!(current && me && current.ownerUsername === me.username); }
   function myProjectRole() {

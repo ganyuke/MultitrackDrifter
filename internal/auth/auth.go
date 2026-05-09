@@ -187,18 +187,19 @@ func (s *Service) refreshPrincipal(ctx context.Context, token string, p Principa
 }
 
 func (s *Service) SetColor(ctx context.Context, username, color string) error {
-	if !validColor(color) {
+	canonical, ok := CanonicalColor(color)
+	if !ok {
 		return errors.New("color not in accessible palette")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET color = ?, updated_at = datetime('now') WHERE username = ?`, color, username); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET color = ?, updated_at = datetime('now') WHERE username = ?`, canonical, username); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET user_color = ? WHERE username = ?`, color, username); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET user_color = ? WHERE username = ?`, canonical, username); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -224,13 +225,18 @@ func colorFor(username string) string {
 	return Palette[int(h[0])%len(Palette)]
 }
 
-func validColor(color string) bool {
+func CanonicalColor(color string) (string, bool) {
 	for _, c := range Palette {
 		if strings.EqualFold(c, color) {
-			return true
+			return c, true
 		}
 	}
-	return false
+	return "", false
+}
+
+func validColor(color string) bool {
+	_, ok := CanonicalColor(color)
+	return ok
 }
 
 func containsAnyDN(haystack, needles []string) bool {

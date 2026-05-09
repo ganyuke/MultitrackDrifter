@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
@@ -267,6 +268,139 @@ func TestPatchClipsUpdatesStartsInOneRequest(t *testing.T) {
 	}
 	if len(starts) != 2 || starts[0] != 7000 || starts[1] != 7000 {
 		t.Fatalf("expected both clips at 7000ms, got %#v", starts)
+	}
+}
+
+func TestPatchClipsReturnsMissingIDsWithoutRollingBackValidUpdates(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ctx)
+	projectID := insertTestProject(t, ctx, db)
+	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile"}, hub: realtime.NewHub()}
+
+	clipIDs, _, _, err := s.createSourceRevisionClips(ctx, projectID, []createClipReq{{
+		Perspective: "Main", Track: "Video", Kind: "video", DisplayName: "Camera E", StreamIndex: 0, WallclockStartMS: 1000,
+	}}, storage.ObjectInfo{Name: "camera-e.mp4", SizeBytes: 512, ETag: "etag-e", Ref: storage.ObjectRef{Adapter: "local", Path: "camera-e.mp4"}})
+	if err != nil {
+		t.Fatalf("createSourceRevisionClips: %v", err)
+	}
+	missingID := int64(999999)
+	body := strings.NewReader(`{"updates":[{"clipId":` + itoa(clipIDs[0]) + `,"wallclockStartMs":5000},{"clipId":` + itoa(missingID) + `,"wallclockStartMs":5000}]}`)
+	req := httptest.NewRequest("PATCH", "/api/projects/1/clips", body)
+	req.SetPathValue("projectID", itoa(projectID))
+	req = req.WithContext(context.WithValue(req.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#abcdef"}))
+	rr := httptest.NewRecorder()
+
+	s.patchClips(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("patchClips status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Updates        []map[string]any `json:"updates"`
+		MissingClipIDs []int64          `json:"missingClipIds"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Updates) != 1 || len(got.MissingClipIDs) != 1 || got.MissingClipIDs[0] != missingID {
+		t.Fatalf("unexpected patch response: %#v", got)
+	}
+	var start int64
+	if err := db.QueryRowContext(ctx, `SELECT wallclock_start_ms FROM clips WHERE id=?`, clipIDs[0]).Scan(&start); err != nil {
+		t.Fatal(err)
+	}
+	if start != 5000 {
+		t.Fatalf("valid clip was not updated, start=%d", start)
+	}
+}
+
+func TestDeleteClipsBatchReturnsMissingIDsAsAlreadyGone(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ctx)
+	projectID := insertTestProject(t, ctx, db)
+	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile"}, hub: realtime.NewHub()}
+
+	clipIDs, _, _, err := s.createSourceRevisionClips(ctx, projectID, []createClipReq{
+		{Perspective: "Main", Track: "Video", Kind: "video", DisplayName: "Camera F video", StreamIndex: 0},
+		{Perspective: "Main", Track: "Audio", Kind: "audio", DisplayName: "Camera F audio", StreamIndex: 1},
+	}, storage.ObjectInfo{Name: "camera-f.mp4", SizeBytes: 1024, ETag: "etag-f", Ref: storage.ObjectRef{Adapter: "local", Path: "camera-f.mp4"}})
+	if err != nil {
+		t.Fatalf("createSourceRevisionClips: %v", err)
+	}
+	missingID := int64(999998)
+	body := strings.NewReader(`{"clipIds":[` + itoa(clipIDs[0]) + `,` + itoa(missingID) + `]}`)
+	req := httptest.NewRequest("POST", "/api/projects/1/clips/delete", body)
+	req.SetPathValue("projectID", itoa(projectID))
+	req = req.WithContext(context.WithValue(req.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#abcdef"}))
+	rr := httptest.NewRecorder()
+
+	s.deleteClips(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("deleteClips status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		DeletedClipIDs []int64 `json:"deletedClipIds"`
+		MissingClipIDs []int64 `json:"missingClipIds"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DeletedClipIDs) != 1 || got.DeletedClipIDs[0] != clipIDs[0] || len(got.MissingClipIDs) != 1 || got.MissingClipIDs[0] != missingID {
+		t.Fatalf("unexpected delete response: %#v", got)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM clips WHERE project_id=?`, projectID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one remaining clip, got %d", count)
+	}
+}
+
+func TestListAnnotationsUsesCurrentUserColor(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ctx)
+	projectID := insertTestProject(t, ctx, db)
+	if _, err := db.ExecContext(ctx, `UPDATE users SET color='#0072B2' WHERE username='owner'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO markers(project_id, marker_ts_ms, author_username, author_color, label) VALUES (?, 1000, 'owner', '#D55E00', 'Old marker color')`, projectID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO regions(project_id, region_start_ms, region_end_ms, author_username, author_color, label) VALUES (?, 1000, 2000, 'owner', '#D55E00', 'Old region color')`, projectID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{db: db, hub: realtime.NewHub()}
+
+	markerReq := httptest.NewRequest("GET", "/api/projects/1/markers", nil)
+	markerReq.SetPathValue("projectID", itoa(projectID))
+	markerReq = markerReq.WithContext(context.WithValue(markerReq.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#0072B2"}))
+	markerRR := httptest.NewRecorder()
+	s.listMarkers(markerRR, markerReq)
+	if markerRR.Code != 200 {
+		t.Fatalf("listMarkers status = %d body=%s", markerRR.Code, markerRR.Body.String())
+	}
+	var markers []map[string]any
+	if err := json.NewDecoder(markerRR.Body).Decode(&markers); err != nil {
+		t.Fatal(err)
+	}
+	if len(markers) != 1 || markers[0]["author_color"] != "#0072B2" || markers[0]["color"] != "#0072B2" {
+		t.Fatalf("marker did not use current user color: %#v", markers)
+	}
+
+	regionReq := httptest.NewRequest("GET", "/api/projects/1/regions", nil)
+	regionReq.SetPathValue("projectID", itoa(projectID))
+	regionReq = regionReq.WithContext(context.WithValue(regionReq.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#0072B2"}))
+	regionRR := httptest.NewRecorder()
+	s.listRegions(regionRR, regionReq)
+	if regionRR.Code != 200 {
+		t.Fatalf("listRegions status = %d body=%s", regionRR.Code, regionRR.Body.String())
+	}
+	var regions []map[string]any
+	if err := json.NewDecoder(regionRR.Body).Decode(&regions); err != nil {
+		t.Fatal(err)
+	}
+	if len(regions) != 1 || regions[0]["author_color"] != "#0072B2" || regions[0]["color"] != "#0072B2" {
+		t.Fatalf("region did not use current user color: %#v", regions)
 	}
 }
 

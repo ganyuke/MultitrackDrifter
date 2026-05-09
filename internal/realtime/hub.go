@@ -89,6 +89,31 @@ func (h *Hub) presenceSnapshot(projectID int64) []map[string]string {
 	return users
 }
 
+func (h *Hub) UpdateUserColor(username, color string) {
+	projects := map[int64]bool{}
+	h.mu.Lock()
+	for projectID, clients := range h.projects {
+		for c := range clients {
+			if c.username != username {
+				continue
+			}
+			c.color = color
+			projects[projectID] = true
+		}
+	}
+	h.mu.Unlock()
+
+	for projectID := range projects {
+		h.Broadcast(projectID, Event{
+			Type:      "user.color.updated",
+			ProjectID: projectID,
+			User:      username,
+			Color:     color,
+			Payload:   map[string]string{"username": username, "color": color},
+		})
+	}
+}
+
 type Client struct {
 	hub       *Hub
 	conn      *websocket.Conn
