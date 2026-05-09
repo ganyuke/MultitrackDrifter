@@ -544,25 +544,9 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 			return nil, nil, nil, err
 		}
 
-		// Import is idempotent for the same project/track/source revision/stream. Clicking
-		// the same source repeatedly should select the existing timeline reference instead
-		// of creating duplicate clips or duplicate transcode jobs.
-		var existingClipID int64
-		err = tx.QueryRowContext(ctx, `
-SELECT id FROM clips
-WHERE project_id=? AND source_revision_id=? AND track_id=? AND media_kind=? AND stream_index=?
-LIMIT 1`, projectID, revID, trackID, req.Kind, req.StreamIndex).Scan(&existingClipID)
-		if err == nil {
-			if req.DurationMS > 0 {
-				_, _ = tx.ExecContext(ctx, `UPDATE clips SET duration_ms=CASE WHEN duration_ms=0 THEN ? ELSE duration_ms END, fps_num=COALESCE(fps_num, NULLIF(?,0)), fps_den=COALESCE(fps_den, NULLIF(?,0)), updated_at=datetime('now') WHERE id=?`, req.DurationMS, req.FPSNum, req.FPSDen, existingClipID)
-			}
-			clipIDs = append(clipIDs, existingClipID)
-			reusedClipIDs = append(reusedClipIDs, existingClipID)
-			continue
-		}
-		if err != sql.ErrNoRows {
-			return nil, nil, nil, err
-		}
+		// Timeline imports always create a fresh clip row. Source assets, source
+		// revisions, and HLS assets stay de-duplicated below, but users may reuse the
+		// same source stream multiple times in the same perspective/track.
 
 		var hlsID sql.NullInt64
 		durationMS := req.DurationMS
