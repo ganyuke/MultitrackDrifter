@@ -1,4 +1,7 @@
 import Hls from 'hls.js';
+import { MS_PER_SECOND } from './lib/constants.js';
+
+const DEFAULT_VIDEO_ASPECT = { width: 16, height: 9 };
 
 export function attachHLS(media, url) {
   if (!media || !url) return () => {};
@@ -33,31 +36,32 @@ export function savePrefs(projectId, prefs) {
 }
 
 export function clipLocalSeconds(wallclockMs, clip, softNudgeMs = 0) {
-  return (wallclockMs - clip.wallclockStartMs + softNudgeMs) / 1000;
+  return (wallclockMs - clip.wallclockStartMs + softNudgeMs) / MS_PER_SECOND;
+}
+
+function fitVideo(node) {
+  const parent = node.parentElement;
+  if (!parent) return;
+  const width = parent.clientWidth;
+  const height = parent.clientHeight;
+  const videoWidth = node.videoWidth || DEFAULT_VIDEO_ASPECT.width;
+  const videoHeight = node.videoHeight || DEFAULT_VIDEO_ASPECT.height;
+  if (!width || !height || !videoWidth || !videoHeight) return;
+
+  const parentAspect = width / height;
+  const videoAspect = videoWidth / videoHeight;
+  if (parentAspect > videoAspect) {
+    node.style.height = `${height}px`;
+    node.style.width = `${Math.floor(height * videoAspect)}px`;
+  } else {
+    node.style.width = `${width}px`;
+    node.style.height = `${Math.floor(width / videoAspect)}px`;
+  }
 }
 
 export function fitVideoToCell(node) {
   let ro;
-
-  function fit() {
-    const parent = node.parentElement;
-    if (!parent) return;
-    const width = parent.clientWidth;
-    const height = parent.clientHeight;
-    const videoWidth = node.videoWidth || 16;
-    const videoHeight = node.videoHeight || 9;
-    if (!width || !height || !videoWidth || !videoHeight) return;
-
-    const parentAspect = width / height;
-    const videoAspect = videoWidth / videoHeight;
-    if (parentAspect > videoAspect) {
-      node.style.height = `${height}px`;
-      node.style.width = `${Math.floor(height * videoAspect)}px`;
-    } else {
-      node.style.width = `${width}px`;
-      node.style.height = `${Math.floor(width / videoAspect)}px`;
-    }
-  }
+  const fit = () => fitVideo(node);
 
   node.addEventListener('loadedmetadata', fit);
   window.addEventListener('resize', fit);
@@ -75,4 +79,9 @@ export function fitVideoToCell(node) {
       ro?.disconnect();
     }
   };
+}
+
+export function fitVideoToCellAttachment(node) {
+  const action = fitVideoToCell(node);
+  return () => action.destroy();
 }
