@@ -175,7 +175,8 @@
     markers = state.markers || [];
     regions = state.regions || [];
     members = state.members || [];
-    reconcileOrdering();
+    // Load prefs FIRST so reconcileOrdering can normalise against saved
+    // visibleTrackIds/activeAudioIds rather than defaulting them to all-on.
     const prefs = loadPrefs(id);
     gridPreset = prefs.gridPreset || '2x2';
     perspectiveOrder = prefs.perspectiveOrder || [];
@@ -186,13 +187,14 @@
     rememberedPerspectiveAudioIds = prefs.rememberedPerspectiveAudioIds || {};
     visibleTrackIds = prefs.visibleTrackIds || [...new Set(videoClips.map(c => c.trackId))];
     activeAudioIds = prefs.activeAudioIds || [...new Set(audioClips.map(c => c.trackId))];
-    reconcileOrdering();
     softNudges = prefs.softNudges || {};
     volumes = prefs.volumes || {};
     selectedClipId = prefs.selectedClipId || null;
     selectedClipIds = Array.isArray(prefs.selectedClipIds) ? prefs.selectedClipIds : (selectedClipId ? [selectedClipId] : []);
     snapEnabled = prefs.snapEnabled ?? true;
     linkedMoveEnabled = prefs.linkedMoveEnabled ?? true;
+    // Single reconcile pass now that prefs are in place.
+    reconcileOrdering();
     reconcileSelection();
     connectWS(id);
     if (canAnnotateProject()) await browseSources('');
