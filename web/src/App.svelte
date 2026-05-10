@@ -113,7 +113,7 @@
     // Ingest progress comes via WebSocket (clip.ingest.progress events).
     // No polling needed; refreshIngestJobs is called on demand when panel opens.
     const poller = setInterval(() => {
-      if (current && showIngestPanel && pendingJobCount > 0) refreshIngestJobs();
+      if (current && showIngestPanel) refreshIngestJobs();
     }, 5000);
     boot();
     return () => {
@@ -266,6 +266,7 @@
         }
       } else if (msg.type === 'clip.ingest.progress') {
         applyJobProgress(msg.payload || {});
+        if (showIngestPanel) refreshIngestJobs();
       } else if (msg.type?.startsWith('marker.') || msg.type?.startsWith('region.') || msg.type?.startsWith('clip.')) {
         // Refresh state once per WS event instead of separate project+manifest+markers+regions fetches.
         await refreshProject();

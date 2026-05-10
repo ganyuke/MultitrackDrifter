@@ -915,6 +915,12 @@ func (s *Server) retryClipIngest(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err)
 			return
 		}
+		// Mark all previous FAILED jobs for this clip as cancelled so they
+		// don't keep showing in the UI after the retry succeeds.
+		if _, err := s.db.ExecContext(r.Context(), `UPDATE ingest_jobs SET state='FAILED', error='superseded by retry', updated_at=datetime('now') WHERE clip_id=? AND project_id=? AND state='FAILED'`, clipID, projectID); err != nil {
+			writeError(w, 500, err)
+			return
+		}
 		status = "PENDING"
 	}
 	ids, err := s.enqueueClipJobs(r.Context(), projectID, []int64{clipID})
