@@ -248,6 +248,12 @@ UPDATE project_memberships SET role='editor' WHERE role='member';
 {4, `SELECT 1`},
 {5, `SELECT 1`},
 {6, `SELECT 1`},
+// Migration 7: index strong_hash for ETag-based revision dedup.
+{7, `
+CREATE INDEX IF NOT EXISTS idx_source_asset_revisions_strong_hash
+  ON source_asset_revisions(source_asset_id, strong_hash)
+  WHERE strong_hash IS NOT NULL;
+`},
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {

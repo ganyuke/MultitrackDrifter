@@ -614,6 +614,7 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 		linkGroupID = newLinkGroupID()
 	}
 	fp := ingest.FingerprintJSON(info)
+	etagHash := ingest.ETagHash(info)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, nil, err
@@ -639,16 +640,29 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 		_, _ = tx.ExecContext(ctx, `UPDATE source_assets SET current_key=?, current_path=?, updated_at=datetime('now') WHERE id=?`, info.Ref.Key, info.Ref.Path, assetID)
 	}
 
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM source_asset_revisions WHERE source_asset_id=? AND fingerprint_json=?`, assetID, fp).Scan(&revID); err == sql.ErrNoRows {
+	// Dedup: try ETag hash first (reliable content identity from Garage/S3 HeadObject,
+	// no download needed). Fall back to full fingerprint for local files or multipart uploads.
+	if etagHash != "" {
+		_ = tx.QueryRowContext(ctx, `SELECT id FROM source_asset_revisions WHERE source_asset_id=? AND strong_hash=?`, assetID, etagHash).Scan(&revID)
+	}
+	if revID == 0 {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM source_asset_revisions WHERE source_asset_id=? AND fingerprint_json=?`, assetID, fp).Scan(&revID)
+	}
+	if revID == 0 {
+		if !errors.Is(err, sql.ErrNoRows) && err != nil {
+			return nil, nil, nil, err
+		}
+		var etagHashVal any
+		if etagHash != "" {
+			etagHashVal = etagHash
+		}
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO source_asset_revisions(source_asset_id, adapter, bucket, key, path, size_bytes, fingerprint_json) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			assetID, info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, info.SizeBytes, fp)
+		res, err = tx.ExecContext(ctx, `INSERT INTO source_asset_revisions(source_asset_id, adapter, bucket, key, path, size_bytes, fingerprint_json, strong_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			assetID, info.Ref.Adapter, info.Ref.Bucket, info.Ref.Key, info.Ref.Path, info.SizeBytes, fp, etagHashVal)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		revID, _ = res.LastInsertId()
-	} else if err != nil {
-		return nil, nil, nil, err
 	}
 
 	perspIDs := map[string]int64{}

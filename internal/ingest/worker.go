@@ -723,8 +723,49 @@ func immutableAssetPath(revisionID int64, streamIndex int, profile string) strin
 	return fmt.Sprintf("rev-%d/stream-%d/%s/%s", revisionID, streamIndex, profile, hex.EncodeToString(h[:])[:12])
 }
 
+// fingerprint is a fixed-field struct so json.Marshal produces a stable,
+// deterministic byte sequence regardless of Go map iteration order.
+type fingerprint struct {
+	Adapter      string `json:"adapter"`
+	Bucket       string `json:"bucket,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Size         int64  `json:"size"`
+	ModifiedUnix int64  `json:"modifiedUnix,omitempty"`
+	ETag         string `json:"etag,omitempty"`
+	Device       uint64 `json:"device,omitempty"`
+	Inode        uint64 `json:"inode,omitempty"`
+}
+
+// FingerprintJSON returns a stable JSON fingerprint for a source object.
+// Field order is deterministic because it uses a struct, not a map.
 func FingerprintJSON(info storage.ObjectInfo) string {
-	m := map[string]any{"adapter": info.Ref.Adapter, "bucket": info.Ref.Bucket, "key": info.Ref.Key, "path": info.Ref.Path, "size": info.SizeBytes, "modifiedUnix": info.ModifiedUnix, "etag": info.ETag, "device": info.Device, "inode": info.Inode}
-	b, _ := json.Marshal(m)
+	fp := fingerprint{
+		Adapter:      info.Ref.Adapter,
+		Bucket:       info.Ref.Bucket,
+		Key:          info.Ref.Key,
+		Path:         info.Ref.Path,
+		Size:         info.SizeBytes,
+		ModifiedUnix: info.ModifiedUnix,
+		ETag:         info.ETag,
+		Device:       info.Device,
+		Inode:        info.Inode,
+	}
+	b, _ := json.Marshal(fp)
 	return string(b)
+}
+
+// ETagHash returns a hex-encoded SHA-256 of the ETag when available.
+// For Garage/S3 single-part uploads the ETag is the MD5 of the content,
+// making it a reliable content-identity key without a full download.
+// Returns empty string when ETag is absent.
+func ETagHash(info storage.ObjectInfo) string {
+	etag := strings.Trim(strings.TrimSpace(info.ETag), `"`)
+	if etag == "" || strings.Contains(etag, "-") {
+		// Empty or multipart ETag (md5-of-md5s, e.g. "abc123-5") — not a
+		// reliable content identity, skip.
+		return ""
+	}
+	h := sha256.Sum256([]byte(etag))
+	return hex.EncodeToString(h[:])
 }
