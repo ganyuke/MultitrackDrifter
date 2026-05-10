@@ -1242,6 +1242,14 @@ func (s *Server) cachedHLSURL(ctx context.Context, ref storage.ObjectRef, ttl ti
 	if s.urlCache.m == nil {
 		s.urlCache.m = make(map[string]signedURLCacheEntry)
 	}
+	// Evict expired entries when the cache grows large.
+	if len(s.urlCache.m) > 512 {
+		for k, v := range s.urlCache.m {
+			if now.After(v.expiresAt) {
+				delete(s.urlCache.m, k)
+			}
+		}
+	}
 	s.urlCache.m[key] = signedURLCacheEntry{url: u, expiresAt: now.Add(exp)}
 	s.urlCache.mu.Unlock()
 	return u, nil

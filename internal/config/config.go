@@ -64,7 +64,7 @@ func Load() (Config, error) {
 		CookieSecret:      getenv("COOKIE_SECRET", "dev-change-me-32-bytes-minimum"),
 		SecureCookies:     getenvBool("SECURE_COOKIES", false),
 		SessionTTL:        time.Duration(getenvInt("SESSION_TTL_HOURS", 12)) * time.Hour,
-		DevAuthEnabled:    getenvBool("DEV_AUTH_ENABLED", true),
+		DevAuthEnabled:    getenvBool("DEV_AUTH_ENABLED", false),
 		SourceAdapter:     getenv("SOURCE_ADAPTER", "local"),
 		SourceLocalRoot:   getenv("SOURCE_LOCAL_ROOT", "./storage/source"),
 		HLSAdapter:        getenv("HLS_ADAPTER", "local"),

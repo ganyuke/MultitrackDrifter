@@ -4,8 +4,11 @@
   import { attachHLS, clipLocalSeconds, fitVideoToCell, loadPrefs, savePrefs } from './playback.js';
 
   let me = null;
-  let username = 'alice';
-  let password = 'dev';
+  let devAuthMode = false;
+  let loading = false;
+  let loadingProject = false;
+  let username = '';
+  let password = '';
   let error = '';
   let importError = '';
   let errorTimer = null;
@@ -38,6 +41,8 @@
   let selectedClipIds = [];
   let snapEnabled = true;
   let linkedMoveEnabled = true;
+  let undoStack = []; // [{clipIds:[...], starts:{id:ms,...}}]
+  let redoStack = [];
   let perspectiveOrder = [];
   let trackOrder = [];
   let collapsedPerspectiveIds = [];
@@ -65,6 +70,7 @@
 
   let timelineViewport;
   let timelineCanvas;
+  let zoomLevel = 1.0; // 0.25..4
   let dragState = null;
   let marqueeState = null;
 
@@ -93,7 +99,7 @@
   $: selectedClip = allClips.find(c => c.clipId === selectedClipId) || null;
   $: selectedClips = selectedClipIds.map(id => allClips.find(c => String(c.clipId) === String(id))).filter(Boolean);
   $: timelineEndMs = timelineEnd(allClips, wallclockMs);
-  $: timelineLaneWidthPx = Math.max(900, Math.ceil(timelineEndMs / 45));
+  $: timelineLaneWidthPx = Math.max(900, Math.ceil((timelineEndMs / 45) * zoomLevel));
   $: timelineWidthPx = timelineLaneWidthPx;
   $: tickMarks = makeTicks(timelineEndMs);
   $: activeAudioClips = audioClips.filter(c => hasId(activeAudioIds, c.trackId));
@@ -104,10 +110,11 @@
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
     const timer = setInterval(syncPlayingMedia, 250);
+    // Ingest progress comes via WebSocket (clip.ingest.progress events).
+    // No polling needed; refreshIngestJobs is called on demand when panel opens.
     const poller = setInterval(() => {
-      if (current && (statusCounts.queued > 0 || statusCounts.processing > 0)) refreshProject();
       if (current && showIngestPanel && pendingJobCount > 0) refreshIngestJobs();
-    }, 2000);
+    }, 5000);
     boot();
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
@@ -117,11 +124,12 @@
   });
 
   async function boot() {
-    try { me = await api('/api/me'); await loadProjects(); }
+    try { me = await api('/api/me'); devAuthMode = me.devAuth || false; await loadProjects(); }
     catch (_) { me = null; }
   }
 
   async function login() {
+    loading = true;
     try { error = ''; me = await postJSON('/api/login', { username, password }); await loadProjects(); }
     catch (e) { setError(e.message, 0); }
   }
@@ -159,6 +167,7 @@
   }
 
   async function openProject(id) {
+    loadingProject = true;
     // Single round-trip replaces: project + playback-manifest + markers + regions + members
     const state = await api(`/api/projects/${id}/state`);
     current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
@@ -191,6 +200,7 @@
     await refreshIngestJobs();
     await tick();
     attachAll();
+    loadingProject = false;
   }
 
   async function refreshProject() {
@@ -452,6 +462,16 @@
 
   async function moveClipStarts(startsById) {
     if (!isProjectOwner()) { setError(projectOwnerMessage()); return; }
+    // Push undo snapshot before committing
+    const snapshot = {};
+    for (const id of Object.keys(startsById)) {
+      const clip = allClips.find(c => String(c.clipId) === String(id));
+      if (clip) snapshot[id] = clip.wallclockStartMs;
+    }
+    if (Object.keys(snapshot).length) {
+      undoStack = [...undoStack.slice(-49), { clipIds: Object.keys(startsById), starts: snapshot }];
+      redoStack = [];
+    }
     const entries = Object.entries(startsById)
       .map(([id, start]) => [id, Math.max(0, Math.round(Number(start)))])
       .filter(([id, start]) => Number.isFinite(start) && allClips.some(c => String(c.clipId) === String(id) && Math.round(c.wallclockStartMs) !== start));
@@ -601,10 +621,7 @@
 
   async function renameSelectedClip() {
     if (!selectedClip || !isProjectOwner()) return;
-    const name = prompt('Clip name', selectedClip.displayName || '');
-    if (name === null) return;
-    await patchJSON(`/api/projects/${current.id}/clips/${selectedClip.clipId}`, { displayName: name });
-    await refreshProject();
+    startRename('clip', selectedClip.clipId, selectedClip.displayName || '');
   }
 
   function clipIdOf(clipOrId) {
@@ -1147,6 +1164,39 @@
     return cells;
   }
 
+  async function undo() {
+    if (!undoStack.length || !current) return;
+    const entry = undoStack[undoStack.length - 1];
+    // Save redo snapshot
+    const redoSnap = {};
+    for (const id of entry.clipIds) {
+      const clip = allClips.find(c => String(c.clipId) === String(id));
+      if (clip) redoSnap[id] = clip.wallclockStartMs;
+    }
+    redoStack = [...redoStack, { clipIds: entry.clipIds, starts: redoSnap }];
+    undoStack = undoStack.slice(0, -1);
+    await applyClipStarts(entry.starts);
+  }
+
+  async function redo() {
+    if (!redoStack.length || !current) return;
+    const entry = redoStack[redoStack.length - 1];
+    const undoSnap = {};
+    for (const id of entry.clipIds) {
+      const clip = allClips.find(c => String(c.clipId) === String(id));
+      if (clip) undoSnap[id] = clip.wallclockStartMs;
+    }
+    undoStack = [...undoStack, { clipIds: entry.clipIds, starts: undoSnap }];
+    redoStack = redoStack.slice(0, -1);
+    await applyClipStarts(entry.starts);
+  }
+
+  async function applyClipStarts(starts) {
+    const updates = Object.entries(starts).map(([id, ms]) => ({ clipId: Number(id), wallclockStartMs: ms }));
+    await patchJSON(`/api/projects/${current.id}/clips`, { updates });
+    await refreshProject();
+  }
+
   function handleKeyDown(event) {
     if (event.key === 'Escape') {
       if (annotationEditor) { event.preventDefault(); annotationEditor = null; annotationSaved = ''; return; }
@@ -1163,6 +1213,10 @@
     if (event.key === 'ArrowLeft') { wallclockMs = Math.max(0, wallclockMs - (event.shiftKey ? 1000 : 100)); seekAll(); }
     if (event.key === 'ArrowRight') { wallclockMs += event.shiftKey ? 1000 : 100; seekAll(); }
     if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClipIds.length) { event.preventDefault(); deleteSelectedClips(); }
+    if (event.key === '+' || event.key === '=') { zoomLevel = Math.min(4, +(zoomLevel + 0.25).toFixed(2)); }
+    if (event.key === '-') { zoomLevel = Math.max(0.25, +(zoomLevel - 0.25).toFixed(2)); }
+    if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key === 'z') { event.preventDefault(); undo(); }
+    if ((event.metaKey || event.ctrlKey) && (event.shiftKey && event.key === 'z' || event.key === 'y')) { event.preventDefault(); redo(); }
     if (event.key === '?') showKeyboardHelp = !showKeyboardHelp;
   }
 
@@ -1274,9 +1328,9 @@
     <p class="login-sub">Self-hosted multicam review</p>
     <label>Username<input bind:value={username} autocomplete="username" /></label>
     <label>Password<input bind:value={password} type="password" autocomplete="current-password" /></label>
-    <button class="btn-primary full" onclick={login}>Sign in</button>
+    <button class="btn-primary full" onclick={login} disabled={loading}>{loading ? 'Signing in…' : 'Sign in'}</button>
     {#if error}<p class="error">{error}</p>{/if}
-    <p class="muted hint-small">Dev auth accepts any credentials when DEV_AUTH_ENABLED=true.</p>
+    {#if devAuthMode}<p class="warn-hint">⚠ DEV_AUTH_ENABLED — any credentials accepted. Not for production.</p>{/if}
   </section>
 </main>
 
@@ -1394,6 +1448,9 @@
       <div class="float-head"><span>Keyboard shortcuts</span><button class="topbar-icon-btn" onclick={() => showKeyboardHelp = false}>×</button></div>
       <table class="kbd-table">
         <tbody>
+          <tr><td><kbd>⌘Z</kbd> / <kbd>Ctrl+Z</kbd></td><td>Undo clip move</td></tr>
+          <tr><td><kbd>⌘⇧Z</kbd> / <kbd>Ctrl+Y</kbd></td><td>Redo</td></tr>
+          <tr><td><kbd>+</kbd> / <kbd>−</kbd></td><td>Zoom timeline in/out</td></tr>
           <tr><td><kbd>Space</kbd></td><td>Play / Pause</td></tr>
           <tr><td><kbd>M</kbd></td><td>Add marker at playhead</td></tr>
           <tr><td><kbd>R</kbd></td><td>Add 5s region at playhead</td></tr>
@@ -1488,6 +1545,7 @@
     </div>
   {/if}
 
+  {#if loadingProject}<div class="loading-overlay"><span class="loading-spinner"></span></div>{/if}
   {#if current}
   <div class="body-cols">
 
@@ -1627,7 +1685,12 @@
             </button>
           </div>
           <div class="tbar-r">
-            <span class="tbar-hint">Shift-click = multi-select · Shift-drag empty lane = marquee · Drag selected = move selection · Delete = remove selection</span>
+            <div class="zoom-controls">
+              <button class="tbar-tool-btn" onclick={() => zoomLevel = Math.max(0.25, +(zoomLevel - 0.25).toFixed(2))} title="Zoom out (−)">−</button>
+              <span class="zoom-label" title="Click to reset" onclick={() => zoomLevel = 1.0} role="button" tabindex="0" onkeydown={(e) => e.key === 'Enter' && (zoomLevel = 1.0)}>{Math.round(zoomLevel * 100)}%</span>
+              <button class="tbar-tool-btn" onclick={() => zoomLevel = Math.min(4, +(zoomLevel + 0.25).toFixed(2))} title="Zoom in (+)">+</button>
+            </div>
+            <span class="tbar-hint">Shift-drag = marquee · Delete = remove selection</span>
           </div>
         </div>
 

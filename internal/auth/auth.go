@@ -28,6 +28,7 @@ type Principal struct {
 	Color             string `json:"color"`
 	CanCreateProjects bool   `json:"canCreateProjects"`
 	ExpiresAt         string `json:"expiresAt"`
+	DevAuth           bool   `json:"devAuth,omitempty"`
 }
 
 type Service struct {
@@ -76,6 +77,7 @@ ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name, can_crea
 	principal.DisplayName = display
 	principal.Color = color
 	principal.CanCreateProjects = canCreate
+	principal.DevAuth = s.cfg.DevAuthEnabled
 	return principal, token, nil
 }
 
@@ -160,6 +162,7 @@ WHERE s.token_hash = ?`, s.tokenHash(token)).Scan(&p.Username, &p.DisplayName, &
 		return Principal{}, err
 	}
 	p.CanCreateProjects = canInt == 1
+	p.DevAuth = s.cfg.DevAuthEnabled
 	exp, err := time.Parse(time.RFC3339, p.ExpiresAt)
 	if err != nil || time.Now().After(exp) {
 		_ = s.Logout(ctx, token)
