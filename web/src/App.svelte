@@ -171,12 +171,11 @@
     // Single round-trip replaces: project + playback-manifest + markers + regions + members
     const state = await api(`/api/projects/${id}/state`);
     current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
-    manifest = { clips: state.clips || [] };
+    const clips = state.clips || [];
+    manifest = { clips };
     markers = state.markers || [];
     regions = state.regions || [];
     members = state.members || [];
-    // Load prefs FIRST so reconcileOrdering can normalise against saved
-    // visibleTrackIds/activeAudioIds rather than defaulting them to all-on.
     const prefs = loadPrefs(id);
     gridPreset = prefs.gridPreset || '2x2';
     perspectiveOrder = prefs.perspectiveOrder || [];
@@ -185,16 +184,17 @@
     hiddenPerspectiveIds = prefs.hiddenPerspectiveIds || [];
     rememberedPerspectiveViewIds = prefs.rememberedPerspectiveViewIds || {};
     rememberedPerspectiveAudioIds = prefs.rememberedPerspectiveAudioIds || {};
-    visibleTrackIds = prefs.visibleTrackIds || [...new Set(videoClips.map(c => c.trackId))];
-    activeAudioIds = prefs.activeAudioIds || [...new Set(audioClips.map(c => c.trackId))];
+    const allVideoTrackIds = [...new Set(clips.filter(c => c.kind === 'video').map(c => c.trackId))];
+    const allAudioTrackIds = [...new Set(clips.filter(c => c.kind === 'audio').map(c => c.trackId))];
+    visibleTrackIds = prefs.visibleTrackIds || allVideoTrackIds;
+    activeAudioIds = prefs.activeAudioIds || allAudioTrackIds;
     softNudges = prefs.softNudges || {};
     volumes = prefs.volumes || {};
     selectedClipId = prefs.selectedClipId || null;
     selectedClipIds = Array.isArray(prefs.selectedClipIds) ? prefs.selectedClipIds : (selectedClipId ? [selectedClipId] : []);
     snapEnabled = prefs.snapEnabled ?? true;
     linkedMoveEnabled = prefs.linkedMoveEnabled ?? true;
-    // Single reconcile pass now that prefs are in place.
-    reconcileOrdering();
+    reconcileOrdering(clips);
     reconcileSelection();
     connectWS(id);
     if (canAnnotateProject()) await browseSources('');
@@ -210,11 +210,12 @@
     const id = current.id;
     const state = await api(`/api/projects/${id}/state`);
     current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
-    manifest = { clips: state.clips || [] };
+    const clips = state.clips || [];
+    manifest = { clips };
     markers = state.markers || [];
     regions = state.regions || [];
     members = state.members || [];
-    reconcileOrdering();
+    reconcileOrdering(clips);
     reconcileSelection();
     await tick();
     attachAll();
@@ -659,10 +660,11 @@
     if (!doomed.size) return;
     const removedClips = (manifest.clips || []).filter(c => doomed.has(String(c.clipId)));
     for (const clip of removedClips) cleanupClipMedia(clip.clipId);
-    manifest = { ...manifest, clips: (manifest.clips || []).filter(c => !doomed.has(String(c.clipId))) };
+    const updatedClips = (manifest.clips || []).filter(c => !doomed.has(String(c.clipId)));
+    manifest = { ...manifest, clips: updatedClips };
     selectedClipIds = selectedClipIds.filter(id => !doomed.has(String(id)));
     if (selectedClipId && doomed.has(String(selectedClipId))) selectedClipId = selectedClipIds[0] || null;
-    reconcileOrdering();
+    reconcileOrdering(updatedClips);
     reconcileSelection();
     persistPrefs();
   }
@@ -1082,11 +1084,11 @@
     return t;
   }
 
-  function reconcileOrdering() {
-    const pKeys = [...new Set(allClips.map(c => perspectiveKey(c)))].sort((a, b) => a.localeCompare(b));
+  function reconcileOrdering(clips = allClips) {
+    const pKeys = [...new Set(clips.map(c => perspectiveKey(c)))].sort((a, b) => a.localeCompare(b));
     perspectiveOrder = [...perspectiveOrder.filter(p => pKeys.includes(p)), ...pKeys.filter(p => !perspectiveOrder.includes(p))];
-    const tKeys = [...new Set(allClips.map(c => c.trackId))];
-    const trackById = new Map(allClips.map(c => [c.trackId, c]));
+    const tKeys = [...new Set(clips.map(c => c.trackId))];
+    const trackById = new Map(clips.map(c => [c.trackId, c]));
     const existing = trackOrder.filter(t => tKeys.includes(t));
     const known = new Set(existing);
     const fallback = [...tKeys].sort((a, b) => {
@@ -1101,6 +1103,9 @@
     activeAudioIds = normalizeTrackIds(activeAudioIds, tKeys);
     for (const id of tKeys) {
       const clip = trackById.get(id);
+      // Only auto-enable tracks that are genuinely new (not in any saved order).
+      // Tracks the user has explicitly disabled will be in trackOrder but not in
+      // visibleTrackIds/activeAudioIds — don't re-enable them.
       if (!known.has(id) && clip?.kind === 'video' && !hasId(visibleTrackIds, id)) visibleTrackIds = addIds(visibleTrackIds, [id]);
       if (!known.has(id) && clip?.kind === 'audio' && !hasId(activeAudioIds, id)) activeAudioIds = addIds(activeAudioIds, [id]);
     }
