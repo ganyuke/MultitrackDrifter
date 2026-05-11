@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/multitrack-drifter/internal/config"
-	"github.com/example/multitrack-drifter/internal/hlsassets"
-	"github.com/example/multitrack-drifter/internal/storage"
+	"github.com/ganyuke/multitrack-drifter/internal/config"
+	"github.com/ganyuke/multitrack-drifter/internal/hlsassets"
+	"github.com/ganyuke/multitrack-drifter/internal/storage"
 )
 
 type memoryHLSStore struct {

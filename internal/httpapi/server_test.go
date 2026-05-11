@@ -10,14 +10,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/multitrack-drifter/internal/auth"
-	"github.com/example/multitrack-drifter/internal/config"
-	dbpkg "github.com/example/multitrack-drifter/internal/db"
-	"github.com/example/multitrack-drifter/internal/hlsassets"
-	"github.com/example/multitrack-drifter/internal/ingest"
-	"github.com/example/multitrack-drifter/internal/realtime"
-	"github.com/example/multitrack-drifter/internal/storage"
-	"github.com/example/multitrack-drifter/internal/storage/localstore"
+	"github.com/ganyuke/multitrack-drifter/internal/auth"
+	"github.com/ganyuke/multitrack-drifter/internal/config"
+	dbpkg "github.com/ganyuke/multitrack-drifter/internal/db"
+	"github.com/ganyuke/multitrack-drifter/internal/hlsassets"
+	"github.com/ganyuke/multitrack-drifter/internal/ingest"
+	"github.com/ganyuke/multitrack-drifter/internal/realtime"
+	"github.com/ganyuke/multitrack-drifter/internal/storage"
+	"github.com/ganyuke/multitrack-drifter/internal/storage/localstore"
 )
 
 func TestCreateSourceRevisionClipsCreatesFreshClipWhenHLSExists(t *testing.T) {

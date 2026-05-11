@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/example/multitrack-drifter/internal/auth"
+	"github.com/ganyuke/multitrack-drifter/internal/auth"
 )
 
 type projectMember struct {

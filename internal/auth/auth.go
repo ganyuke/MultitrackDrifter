@@ -15,7 +15,7 @@ import (
 
 	ldap "github.com/go-ldap/ldap/v3"
 
-	"github.com/example/multitrack-drifter/internal/config"
+	"github.com/ganyuke/multitrack-drifter/internal/config"
 )
 
 const CookieName = "drifter_session"

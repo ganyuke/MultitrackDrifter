@@ -16,12 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/multitrack-drifter/internal/config"
-	ff "github.com/example/multitrack-drifter/internal/ffmpeg"
-	"github.com/example/multitrack-drifter/internal/hlsassets"
-	"github.com/example/multitrack-drifter/internal/realtime"
-	"github.com/example/multitrack-drifter/internal/storage"
-	"github.com/example/multitrack-drifter/internal/storage/localstore"
+	"github.com/ganyuke/multitrack-drifter/internal/config"
+	ff "github.com/ganyuke/multitrack-drifter/internal/ffmpeg"
+	"github.com/ganyuke/multitrack-drifter/internal/hlsassets"
+	"github.com/ganyuke/multitrack-drifter/internal/realtime"
+	"github.com/ganyuke/multitrack-drifter/internal/storage"
+	"github.com/ganyuke/multitrack-drifter/internal/storage/localstore"
 )
 
 const (

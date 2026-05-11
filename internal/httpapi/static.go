@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/example/multitrack-drifter/internal/webdist"
+	"github.com/ganyuke/multitrack-drifter/internal/webdist"
 )
 
 func StaticHandler() http.Handler {

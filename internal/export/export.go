@@ -9,7 +9,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/example/multitrack-drifter/internal/timeline"
+	"github.com/ganyuke/multitrack-drifter/internal/timeline"
 )
 
 type Item struct {

@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/multitrack-drifter/internal/storage"
+	"github.com/ganyuke/multitrack-drifter/internal/storage"
 )
 
 type Source struct {

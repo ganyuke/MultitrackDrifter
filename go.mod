@@ -1,4 +1,4 @@
-module github.com/example/multitrack-drifter
+module github.com/ganyuke/multitrack-drifter
 
 go 1.25.0
 

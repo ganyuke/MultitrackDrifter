@@ -12,15 +12,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/multitrack-drifter/internal/auth"
-	"github.com/example/multitrack-drifter/internal/config"
-	"github.com/example/multitrack-drifter/internal/db"
-	"github.com/example/multitrack-drifter/internal/httpapi"
-	"github.com/example/multitrack-drifter/internal/ingest"
-	"github.com/example/multitrack-drifter/internal/realtime"
-	"github.com/example/multitrack-drifter/internal/storage"
-	"github.com/example/multitrack-drifter/internal/storage/localstore"
-	"github.com/example/multitrack-drifter/internal/storage/s3store"
+	"github.com/ganyuke/multitrack-drifter/internal/auth"
+	"github.com/ganyuke/multitrack-drifter/internal/config"
+	"github.com/ganyuke/multitrack-drifter/internal/db"
+	"github.com/ganyuke/multitrack-drifter/internal/httpapi"
+	"github.com/ganyuke/multitrack-drifter/internal/ingest"
+	"github.com/ganyuke/multitrack-drifter/internal/realtime"
+	"github.com/ganyuke/multitrack-drifter/internal/storage"
+	"github.com/ganyuke/multitrack-drifter/internal/storage/localstore"
+	"github.com/ganyuke/multitrack-drifter/internal/storage/s3store"
 )
 
 func main() {
