@@ -76,7 +76,7 @@ func (s *Server) addProjectMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	username := strings.TrimSpace(req.Username)
-	role := normalizeMemberRole(req.Role)
+	role := validateProjectMemberRole(req.Role)
 	if username == "" {
 		writeError(w, 400, errors.New("username required"))
 		return
@@ -128,7 +128,7 @@ func (s *Server) patchProjectMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err)
 		return
 	}
-	role := normalizeMemberRole(req.Role)
+	role := validateProjectMemberRole(req.Role)
 	if role == "" {
 		writeError(w, 400, errors.New("role must be viewer or editor"))
 		return
@@ -176,13 +176,10 @@ func (s *Server) deleteProjectMember(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-// normalizeMemberRole collapses 'member' (legacy synonym) → 'editor'.
-func normalizeMemberRole(role string) string {
+func validateProjectMemberRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
-	case "editor", "member":
-		return "editor"
-	case "viewer":
-		return "viewer"
+	case "editor", "viewer":
+		return strings.ToLower(strings.TrimSpace(role))
 	default:
 		return ""
 	}

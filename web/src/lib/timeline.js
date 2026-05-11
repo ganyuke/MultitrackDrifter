@@ -287,7 +287,7 @@ export function jobStats(job) {
   const stats = [];
   if (job.ffmpeg_fps) stats.push(`${job.ffmpeg_fps} fps`);
   if (job.ffmpeg_bitrate) stats.push(job.ffmpeg_bitrate);
-  if (job.ffmpeg_speed) stats.push(`${job.ffmpeg_speed}×`);
+  if (job.ffmpeg_speed) stats.push(`${job.ffmpeg_speed}`);
   return stats.join(' · ');
 }
 
@@ -306,7 +306,7 @@ export function colorForUsername(username, fallback, me, members = [], presenceU
 }
 
 export function annotationColor(item, fallback, me, members = [], presenceUsers = []) {
-  return item?.author_color || item?.authorColor || colorForUsername(annotationAuthor(item), fallback, me, members, presenceUsers);
+  return item?.authorColor || colorForUsername(annotationAuthor(item), fallback, me, members, presenceUsers);
 }
 
 export function markerColor(marker, me, members = [], presenceUsers = []) {

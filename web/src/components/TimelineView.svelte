@@ -36,7 +36,6 @@
     ontogglesnap,
     ontogglelink,
     ontogglejobs,
-    onrefreshjobs,
     onmoveorder,
     ontogglecollapse,
     onrename,
@@ -76,7 +75,7 @@
       <button class="tbar-tool-btn {snapEnabled ? 'tbar-active' : ''}" onclick={ontogglesnap} title="Snap clip edges to playhead, markers, regions, and other clip edges">Snap</button>
       <button class="tbar-tool-btn {linkedMoveEnabled ? 'tbar-active' : ''}" onclick={ontogglelink} title="Move linked video/audio clips together">Link</button>
       <div class="tbar-sep"></div>
-      <button class="tbar-tool-btn {showIngestPanel ? 'tbar-active' : ''}" onclick={() => { ontogglejobs?.(); if (!showIngestPanel) onrefreshjobs?.(); }}>
+      <button class="tbar-tool-btn {showIngestPanel ? 'tbar-active' : ''}" onclick={() => ontogglejobs?.()}>
         Jobs {pendingJobCount > 0 ? `(${pendingJobCount})` : ''}{failedJobCount > 0 ? ` ⚠${failedJobCount}` : ''}
       </button>
     </div>

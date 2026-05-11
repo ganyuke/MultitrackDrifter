@@ -21,7 +21,6 @@
     DEFAULT_MEMBER_ROLE,
     DEFAULT_PROJECT_NAME,
     HISTORY,
-    HTTP_STATUS,
     MS_PER_SECOND,
     TIMELINE_LAYOUT,
     TIMING,
@@ -46,6 +45,8 @@
     countStatuses,
     jobProgress,
     annotationAuthor,
+    markerColor as markerColorFor,
+    regionColor as regionColorFor,
     withAlpha
   } from './lib/timeline.js';
 
@@ -73,7 +74,7 @@
   let newMemberRole = $state(DEFAULT_MEMBER_ROLE);
   let memberMessage = $state('');
 
-  let manifest = $state({ clips: [] });
+  let clips = $state([]);
   let wallclockMs = $state(0);
   let playing = $state(false);
   let started = $state(false);
@@ -129,10 +130,8 @@
   let renameValue = $state('');
 
   const mediaRegistry = createMediaRegistry();
-  const notFoundStatusPattern = new RegExp(`(^|\\s)${HTTP_STATUS.notFound}(\\s|$)`);
 
-
-  let allClips = $derived(manifest.clips || []);
+  let allClips = $derived(clips);
   let audioClips = $derived(allClips.filter(c => c.kind === 'audio'));
   let perspectiveGroups = $derived(buildPerspectiveGroups(allClips, perspectiveOrder, trackOrder, collapsedPerspectiveIds, hiddenPerspectiveIds, visibleTrackIds, activeAudioIds));
   let trackRows = $derived(flattenTimelineRows(perspectiveGroups));
@@ -173,16 +172,10 @@
   onMount(() => {
     const offKeyDown = on(window, 'keydown', handleKeyDown);
     const timer = setInterval(syncPlayingMedia, TIMING.playbackSyncIntervalMs);
-    // Ingest progress comes via WebSocket (clip.ingest.progress events).
-    // No polling needed; refreshIngestJobs is called on demand when panel opens.
-    const poller = setInterval(() => {
-      if (current && showIngestPanel) refreshIngestJobs();
-    }, TIMING.ingestRefreshIntervalMs);
     boot();
     return () => {
       offKeyDown();
       clearInterval(timer);
-      clearInterval(poller);
     };
   });
 
@@ -235,11 +228,9 @@
   async function openProject(id) {
     loadingProject = true;
     prefsReady = false;
-    // Single round-trip replaces: project + playback-manifest + markers + regions + members
     const state = await api(`/api/projects/${id}/state`);
     current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
-    const clips = state.clips || [];
-    manifest = { clips };
+    clips = state.clips || [];
     markers = state.markers || [];
     regions = state.regions || [];
     members = state.members || [];
@@ -276,8 +267,7 @@
     const id = current.id;
     const state = await api(`/api/projects/${id}/state`);
     current = { id: state.id, name: state.name, description: state.description, ownerUsername: state.ownerUsername };
-    const clips = state.clips || [];
-    manifest = { clips };
+    clips = state.clips || [];
     markers = state.markers || [];
     regions = state.regions || [];
     members = state.members || [];
@@ -346,7 +336,7 @@
       if (!canAnnotateProject()) { sources = []; importProbe = null; importStreams = []; }
       await loadProjects();
     } catch (e) {
-      current = null; manifest = { clips: [] }; markers = []; regions = []; members = []; sources = [];
+      current = null; clips = []; markers = []; regions = []; members = []; sources = [];
       if (ws) ws.close();
       setError('Your access to this project changed.');
       await loadProjects();
@@ -723,19 +713,12 @@
   function removeDeletedClipsFromUI(ids) {
     const doomed = new Set(uniqueClipIds(ids).map(String));
     if (!doomed.size) return;
-    const removedClips = (manifest.clips || []).filter(c => doomed.has(String(c.clipId)));
-    for (const clip of removedClips) cleanupClipMedia(clip.clipId);
-    const updatedClips = (manifest.clips || []).filter(c => !doomed.has(String(c.clipId)));
-    manifest = { ...manifest, clips: updatedClips };
+    const updatedClips = clips.filter(c => !doomed.has(String(c.clipId)));
+    clips = updatedClips;
     selectedClipIds = selectedClipIds.filter(id => !doomed.has(String(id)));
     if (selectedClipId && doomed.has(String(selectedClipId))) selectedClipId = selectedClipIds[0] || null;
     applyReconciledOrdering(updatedClips);
     reconcileSelection();
-
-  }
-
-  function isAlreadyDeletedError(error) {
-    return error?.status === HTTP_STATUS.notFound || notFoundStatusPattern.test(error?.message || '');
   }
 
   async function deleteClipIds(ids) {
@@ -1146,7 +1129,7 @@
     if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
     if (event.key === 'm' || event.key === 'M') addMarker();
     if (event.key === 'r' || event.key === 'R') addRegion();
-    if (event.key === 'j' || event.key === 'J') { showIngestPanel = !showIngestPanel; if (showIngestPanel) refreshIngestJobs(); }
+    if (event.key === 'j' || event.key === 'J') toggleIngestPanel();
     if (event.key === 'ArrowLeft') { wallclockMs = Math.max(0, wallclockMs - (event.shiftKey ? TIMING.largePlayheadJogMs : TIMING.smallPlayheadJogMs)); seekAll(); }
     if (event.key === 'ArrowRight') { wallclockMs += event.shiftKey ? TIMING.largePlayheadJogMs : TIMING.smallPlayheadJogMs; seekAll(); }
     if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClipIds.length) { event.preventDefault(); deleteSelectedClips(); }
@@ -1192,21 +1175,8 @@
     const c = regionColor(r);
     return `left:${msToPx(r.region_start_ms)}px;width:${Math.max(TIMELINE_LAYOUT.minRegionWidthPx, msToLanePx(r.region_end_ms - r.region_start_ms))}px;background:${withAlpha(c, ANNOTATION_COLORS.regionFillAlpha)};border-color:${withAlpha(c, ANNOTATION_COLORS.regionBorderAlpha)};`;
   }
-  function colorForUsername(username, fallback) {
-    if (username && me?.username === username && me.color) return me.color;
-    const member = members.find(m => m.username === username);
-    if (member?.color) return member.color;
-    const present = presenceUsers.find(u => u.username === username);
-    if (present?.color) return present.color;
-    return fallback;
-  }
-  function annotationColor(item, fallback) {
-    // authorColor is the single canonical field from the server JOIN on users.color.
-    const stored = item?.authorColor || fallback;
-    return colorForUsername(annotationAuthor(item), stored);
-  }
-  function markerColor(m) { return annotationColor(m, ANNOTATION_COLORS.markerDefault); }
-  function regionColor(r) { return annotationColor(r, ANNOTATION_COLORS.regionDefault); }
+  function markerColor(m) { return markerColorFor(m, me, members, presenceUsers); }
+  function regionColor(r) { return regionColorFor(r, me, members, presenceUsers); }
 
   function isProjectOwner() { return !!(current && me && current.ownerUsername === me.username); }
   function myProjectRole() {
@@ -1214,7 +1184,7 @@
     if (isProjectOwner()) return 'owner';
     return members.find(m => m.username === me.username)?.role || '';
   }
-  function canAnnotateProject() { return ['owner','editor','member'].includes(myProjectRole()); }
+  function canAnnotateProject() { return ['owner','editor'].includes(myProjectRole()); }
 
   function canEditAnnotation(item) { return !!(item && me && (annotationAuthor(item) === me.username || isProjectOwner())); }
   function annotationEditorCanEdit() { return !!(annotationEditor && me && (annotationEditor.author === me.username || isProjectOwner())); }
@@ -1405,7 +1375,6 @@
       ontoggleplay={togglePlay}
       onstartsession={startSession}
       ontoggleingest={toggleIngestPanel}
-      onrefreshjobs={refreshIngestJobs}
       ontogglecolor={() => showColorPicker = !showColorPicker}
       onlogout={logout}
       ontogglehelp={() => showKeyboardHelp = !showKeyboardHelp}
@@ -1499,7 +1468,6 @@
             ontogglesnap={() => snapEnabled = !snapEnabled}
             ontogglelink={() => linkedMoveEnabled = !linkedMoveEnabled}
             ontogglejobs={toggleIngestPanel}
-            onrefreshjobs={refreshIngestJobs}
             onmoveorder={moveInOrder}
             ontogglecollapse={togglePerspectiveCollapse}
             onrename={startRename}

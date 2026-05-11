@@ -19,7 +19,6 @@
     ontoggleplay,
     onstartsession,
     ontoggleingest,
-    onrefreshjobs,
     ontogglecolor,
     onlogout,
     ontogglehelp
@@ -61,7 +60,7 @@
 
   <div class="topbar-right">
     {#if current && (statusCounts.processing + statusCounts.queued + statusCounts.failed > 0)}
-      <button class="status-chip {statusCounts.failed > 0 ? 'chip-warn' : 'chip-info'}" onclick={() => { ontoggleingest?.(); if (!showIngestPanel) onrefreshjobs?.(); }}>
+      <button class="status-chip {statusCounts.failed > 0 ? 'chip-warn' : 'chip-info'}" onclick={() => ontoggleingest?.()}>
         {#if statusCounts.processing > 0}<span class="pulse-dot"></span>{/if}
         {statusCounts.queued + statusCounts.processing} preparing
         {#if statusCounts.failed > 0} · <strong>{statusCounts.failed} failed</strong>{/if}

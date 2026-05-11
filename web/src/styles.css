@@ -426,7 +426,6 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .role-pill { height:18px; display:inline-flex; align-items:center; justify-content:center; min-width:48px; padding:0 6px; border:1px solid var(--line2); background:var(--raised); color:var(--muted); font-size:9px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; flex-shrink:0; }
 .role-pill.owner { border-color:var(--yellow-dk); background:#1c1608; color:var(--yellow); }
 .role-pill.editor,
-.role-pill.member { border-color:#1a4a30; background:#0c2018; color:var(--green); }
 .role-pill.viewer { border-color:var(--line2); background:var(--panel); color:var(--text2); }
 .tbar-tool-btn:disabled { opacity:.35; cursor:not-allowed; }
 

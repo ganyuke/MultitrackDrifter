@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/example/multitrack-drifter/internal/config"
 	ff "github.com/example/multitrack-drifter/internal/ffmpeg"
+	"github.com/example/multitrack-drifter/internal/hlsassets"
 	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
 	"github.com/example/multitrack-drifter/internal/storage/localstore"
@@ -228,9 +230,8 @@ WHERE state='PROCESSING'`)
 }
 
 func (w *Worker) reconcileClipStatuses(ctx context.Context) error {
-	// A clip status is what the playback manifest and timeline UI render. Keep it
-	// in sync with the latest job so a crash or older bug cannot strand a clip as
-	// PROCESSING forever after the worker is no longer doing work for it.
+	// Clip status drives playback availability and timeline rendering. Keep it in
+	// sync with the latest job so interrupted work does not leave clips PROCESSING.
 	res, err := w.db.ExecContext(ctx, `
 UPDATE clips
 SET ingest_status = COALESCE((
@@ -369,7 +370,6 @@ func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
 		meta.DurationMS = 1000
 	}
 
-	assetPath := immutableAssetPath(job.SourceRevisionID, streamIndex, w.cfg.TranscodeProfile)
 	tmp, err := os.MkdirTemp("", "drifter-hls-*")
 	if err != nil {
 		return err
@@ -380,8 +380,14 @@ func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
 	if err := w.runner.TranscodeHLS(ctx, input, tmp, streamIndex, kind, ff.TranscodeOptions{Preset: w.cfg.TranscodePreset, SegmentSeconds: w.cfg.HLSSegmentSeconds, Progress: progress}); err != nil {
 		return err
 	}
+	w.setJobStage(ctx, claimed, "reserving HLS asset", 0.97, meta.DurationMS)
+	hlsID, err := w.ensureHLSAsset(ctx, job.SourceRevisionID, streamIndex, kind, meta)
+	if err != nil {
+		return err
+	}
 	w.setJobStage(ctx, claimed, "uploading HLS", 0.98, meta.DurationMS)
-	if err := w.uploadHLSDirectory(ctx, tmp, assetPath); err != nil {
+	playlistPath, err := w.publishContentAddressedHLS(ctx, tmp, hlsID)
+	if err != nil {
 		return err
 	}
 	w.setJobStage(ctx, claimed, "finalizing", 0.99, meta.DurationMS)
@@ -390,13 +396,7 @@ func (w *Worker) processErr(ctx context.Context, claimed claimedJob) error {
 	if err != nil {
 		return err
 	}
-	var hlsID int64
-	err = tx.QueryRowContext(ctx, `
-INSERT INTO hls_assets(source_revision_id, adapter, playlist_path, stream_id, media_kind, transcode_profile_version, duration_ms, fps_num, fps_den)
-VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0))
-ON CONFLICT(source_revision_id, stream_id, transcode_profile_version) DO UPDATE SET duration_ms=excluded.duration_ms
-RETURNING id`, job.SourceRevisionID, w.cfg.HLSAdapter, assetPath+"/index.m3u8", fmt.Sprintf("stream-%d", streamIndex), kind, w.cfg.TranscodeProfile, meta.DurationMS, meta.FPSNum, meta.FPSDen).Scan(&hlsID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE hls_assets SET playlist_path=?, media_kind=?, duration_ms=?, fps_num=NULLIF(?,0), fps_den=NULLIF(?,0) WHERE id=?`, playlistPath, kind, meta.DurationMS, meta.FPSNum, meta.FPSDen, hlsID); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -431,16 +431,23 @@ func (w *Worker) attachExistingHLS(ctx context.Context, job clipJob) (bool, erro
 	streamID := fmt.Sprintf("stream-%d", job.StreamIndex)
 	var hlsID int64
 	var durationMS, fpsNum, fpsDen int64
-	var kind string
+	var kind, playlistPath string
 	err := w.db.QueryRowContext(ctx, `
-SELECT id, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0), media_kind
+SELECT id, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0), media_kind, COALESCE(playlist_path,'')
 FROM hls_assets
-WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`, job.SourceRevisionID, streamID, w.cfg.TranscodeProfile).Scan(&hlsID, &durationMS, &fpsNum, &fpsDen, &kind)
+WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`, job.SourceRevisionID, streamID, w.cfg.TranscodeProfile).Scan(&hlsID, &durationMS, &fpsNum, &fpsDen, &kind, &playlistPath)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if playlistPath != hlsassets.PlaylistPath(hlsID) {
+		return false, nil
+	}
+	if _, err := w.hls.Stat(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: playlistPath}); err != nil {
+		slog.InfoContext(ctx, "ingest: ignoring HLS database row because playlist is missing from storage", "hls_asset_id", hlsID, "playlist_path", playlistPath, "err", err)
+		return false, nil
 	}
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -491,24 +498,105 @@ func (w *Worker) inputPath(ctx context.Context, sourcePath string) (string, func
 	return tmpFile, cleanup, nil
 }
 
-func (w *Worker) uploadHLSDirectory(ctx context.Context, tmp, assetPath string) error {
-	var files []string
-	if err := filepath.WalkDir(tmp, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		files = append(files, path)
-		return nil
-	}); err != nil {
-		return err
+func (w *Worker) ensureHLSAsset(ctx context.Context, sourceRevisionID int64, streamIndex int, kind string, meta ff.Metadata) (int64, error) {
+	var hlsID int64
+	err := w.db.QueryRowContext(ctx, `
+INSERT INTO hls_assets(source_revision_id, playlist_path, stream_id, media_kind, transcode_profile_version, duration_ms, fps_num, fps_den)
+VALUES (?, '', ?, ?, ?, ?, NULLIF(?,0), NULLIF(?,0))
+ON CONFLICT(source_revision_id, stream_id, transcode_profile_version) DO UPDATE SET
+  media_kind=excluded.media_kind,
+  duration_ms=excluded.duration_ms,
+  fps_num=excluded.fps_num,
+  fps_den=excluded.fps_den
+RETURNING id`, sourceRevisionID, fmt.Sprintf("stream-%d", streamIndex), kind, w.cfg.TranscodeProfile, meta.DurationMS, meta.FPSNum, meta.FPSDen).Scan(&hlsID)
+	if err != nil {
+		return 0, err
+	}
+	return hlsID, nil
+}
+
+func (w *Worker) publishContentAddressedHLS(ctx context.Context, tmp string, hlsAssetID int64) (string, error) {
+	playlistPath := hlsassets.PlaylistPath(hlsAssetID)
+	rewritten, err := w.rewriteAndUploadHLSSegments(ctx, tmp)
+	if err != nil {
+		return "", err
+	}
+	if err := w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: playlistPath}, strings.NewReader(rewritten), hlsassets.PlaylistContentType); err != nil {
+		return "", err
+	}
+	return playlistPath, nil
+}
+
+func (w *Worker) rewriteAndUploadHLSSegments(ctx context.Context, tmp string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(tmp, hlsassets.PlaylistFilename))
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(raw), "\n")
+	segmentNames, err := generatedSegmentNames(lines)
+	if err != nil {
+		return "", err
+	}
+	segmentPaths, err := w.uploadContentAddressedHLSSegments(ctx, tmp, segmentNames)
+	if err != nil {
+		return "", err
 	}
 
-	workers := max(1, w.cfg.HLSUploadWorkers)
+	var out strings.Builder
+	for i, line := range lines {
+		if i == len(lines)-1 && line == "" {
+			break
+		}
+		rewritten := line
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			segmentName, err := cleanGeneratedSegmentName(trimmed)
+			if err != nil {
+				return "", err
+			}
+			rewritten = hlsassets.SegmentURI(segmentPaths[segmentName])
+		}
+		out.WriteString(rewritten)
+		if i < len(lines)-1 {
+			out.WriteByte('\n')
+		}
+	}
+	return out.String(), nil
+}
+
+func generatedSegmentNames(lines []string) ([]string, error) {
+	seen := map[string]struct{}{}
+	var names []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		name, err := cleanGeneratedSegmentName(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (w *Worker) uploadContentAddressedHLSSegments(ctx context.Context, tmp string, segmentNames []string) (map[string]string, error) {
+	if len(segmentNames) == 0 {
+		return map[string]string{}, nil
+	}
+	workers := min(max(1, w.cfg.HLSUploadWorkers), len(segmentNames))
 	jobs := make(chan string)
-	errCh := make(chan error, 1)
+	type result struct {
+		name string
+		path string
+		err  error
+	}
+	results := make(chan result, len(segmentNames))
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -517,23 +605,21 @@ func (w *Worker) uploadHLSDirectory(ctx context.Context, tmp, assetPath string) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for path := range jobs {
-				if err := w.uploadHLSFile(uploadCtx, tmp, assetPath, path); err != nil {
-					select {
-					case errCh <- err:
-						cancel()
-					default:
-					}
+			for name := range jobs {
+				path, err := w.uploadContentAddressedHLSSegment(uploadCtx, tmp, name)
+				if err != nil {
+					cancel()
 				}
+				results <- result{name: name, path: path, err: err}
 			}
 		}()
 	}
 
-	for _, path := range files {
+	for _, name := range segmentNames {
 		select {
 		case <-uploadCtx.Done():
 			break
-		case jobs <- path:
+		case jobs <- name:
 		}
 		if uploadCtx.Err() != nil {
 			break
@@ -541,30 +627,77 @@ func (w *Worker) uploadHLSDirectory(ctx context.Context, tmp, assetPath string) 
 	}
 	close(jobs)
 	wg.Wait()
+	close(results)
 
-	select {
-	case err := <-errCh:
-		return err
-	default:
+	segmentPaths := make(map[string]string, len(segmentNames))
+	for res := range results {
+		if res.err != nil {
+			return nil, res.err
+		}
+		segmentPaths[res.name] = res.path
 	}
-	return ctx.Err()
+	if len(segmentPaths) != len(segmentNames) {
+		if err := uploadCtx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("uploaded %d of %d HLS segments", len(segmentPaths), len(segmentNames))
+	}
+	return segmentPaths, nil
 }
 
-func (w *Worker) uploadHLSFile(ctx context.Context, tmp, assetPath, path string) error {
-	rel, err := filepath.Rel(tmp, path)
+func (w *Worker) uploadContentAddressedHLSSegment(ctx context.Context, tmp, segmentName string) (string, error) {
+	localPath := filepath.Join(tmp, filepath.FromSlash(segmentName))
+	sum, err := fileSHA256Hex(localPath)
 	if err != nil {
-		return err
+		return "", err
 	}
-	f, err := os.Open(path)
+	segmentPath := hlsassets.SegmentPath(sum)
+	f, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
-	contentType := "video/MP2T"
-	if strings.HasSuffix(path, ".m3u8") {
-		contentType = "application/vnd.apple.mpegurl"
+	if err := w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: segmentPath}, f, hlsassets.SegmentContentType); err != nil {
+		return "", err
 	}
-	return w.hls.Put(ctx, storage.ObjectRef{Adapter: w.cfg.HLSAdapter, Path: filepath.ToSlash(filepath.Join(assetPath, rel))}, f, contentType)
+	return segmentPath, nil
+}
+
+func cleanGeneratedSegmentName(uri string) (string, error) {
+	cleanURI := strings.TrimSpace(uri)
+	if cleanURI == "" || strings.HasPrefix(cleanURI, "/") || strings.Contains(cleanURI, "://") {
+		return "", fmt.Errorf("unsupported HLS segment URI %q", uri)
+	}
+	if queryAt := strings.IndexByte(cleanURI, '?'); queryAt >= 0 {
+		cleanURI = cleanURI[:queryAt]
+	}
+	if fragmentAt := strings.IndexByte(cleanURI, '#'); fragmentAt >= 0 {
+		cleanURI = cleanURI[:fragmentAt]
+	}
+	cleanURI = path.Clean(strings.ReplaceAll(cleanURI, "\\", "/"))
+	if cleanURI == "." || strings.HasPrefix(cleanURI, "../") || cleanURI == ".." || strings.Contains(cleanURI, "/../") {
+		return "", fmt.Errorf("unsafe HLS segment URI %q", uri)
+	}
+	if path.Base(cleanURI) != cleanURI {
+		return "", fmt.Errorf("nested HLS segment URI %q is not produced by this transcoder", uri)
+	}
+	if !strings.HasSuffix(strings.ToLower(cleanURI), hlsassets.SegmentExtension) {
+		return "", fmt.Errorf("unsupported HLS segment extension in %q", uri)
+	}
+	return cleanURI, nil
+}
+
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (w *Worker) setJobStage(ctx context.Context, job claimedJob, stage string, pct float64, totalDurationMS int64) {
@@ -716,11 +849,6 @@ func (w *Worker) broadcastIngest(projectID, clipID, jobID int64, state, errMsg s
 			"error":  errMsg,
 		},
 	})
-}
-
-func immutableAssetPath(revisionID int64, streamIndex int, profile string) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s", revisionID, streamIndex, profile)))
-	return fmt.Sprintf("rev-%d/stream-%d/%s/%s", revisionID, streamIndex, profile, hex.EncodeToString(h[:])[:12])
 }
 
 // fingerprint is a fixed-field struct so json.Marshal produces a stable,

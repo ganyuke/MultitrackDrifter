@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/example/multitrack-drifter/internal/hlsassets"
 	"github.com/example/multitrack-drifter/internal/storage"
 )
 
@@ -41,7 +42,7 @@ type urlCache struct {
 }
 
 type signedURL struct {
-	url      string
+	url       string
 	expiresAt time.Time
 }
 
@@ -120,7 +121,7 @@ func NewHLS(ctx context.Context, cfg S3Config) (*HLS, error) {
 		bucket:   cfg.Bucket,
 		endpoint: cfg.Endpoint,
 		root:     cfg.Root,
-		cache: &urlCache{ttl: 5 * time.Minute},
+		cache:    &urlCache{ttl: 5 * time.Minute},
 	}, nil
 }
 
@@ -217,13 +218,22 @@ func (h *HLS) Put(ctx context.Context, ref storage.ObjectRef, r io.Reader, conte
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	cacheControl := "public, max-age=31536000, immutable"
+	var expires *time.Time
+	if strings.EqualFold(contentType, hlsassets.PlaylistContentType) || strings.HasSuffix(strings.ToLower(key), ".m3u8") {
+		cacheControl = "no-store"
+	} else {
+		expiresAt := time.Now().Add(365 * 24 * time.Hour)
+		expires = &expiresAt
+	}
+
 	_, err := h.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(h.bucket),
-		Key:           aws.String(key),
-		Body:          r,
-		ContentType:   aws.String(contentType),
-		CacheControl:  aws.String("max-age=31536000, immutable"),
-		Expires:       aws.Time(time.Now().Add(365 * 24 * time.Hour)),
+		Bucket:       aws.String(h.bucket),
+		Key:          aws.String(key),
+		Body:         r,
+		ContentType:  aws.String(contentType),
+		CacheControl: aws.String(cacheControl),
+		Expires:      expires,
 	})
 	if err != nil {
 		return fmt.Errorf("put object: %w", err)

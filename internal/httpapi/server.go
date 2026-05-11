@@ -24,6 +24,7 @@ import (
 	"github.com/example/multitrack-drifter/internal/config"
 	exp "github.com/example/multitrack-drifter/internal/export"
 	ff "github.com/example/multitrack-drifter/internal/ffmpeg"
+	"github.com/example/multitrack-drifter/internal/hlsassets"
 	"github.com/example/multitrack-drifter/internal/ingest"
 	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
@@ -63,7 +64,6 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/me/color", s.auth.Middleware(http.HandlerFunc(s.setColor)))
 	mux.Handle("GET /api/projects", s.auth.Middleware(http.HandlerFunc(s.listProjects)))
 	mux.Handle("POST /api/projects", s.auth.Middleware(http.HandlerFunc(s.createProject)))
-	mux.Handle("GET /api/projects/{projectID}", s.auth.Middleware(http.HandlerFunc(s.getProject)))
 	mux.Handle("PATCH /api/projects/{projectID}", s.auth.Middleware(http.HandlerFunc(s.patchProject)))
 	mux.Handle("GET /api/projects/{projectID}/members", s.auth.Middleware(http.HandlerFunc(s.listProjectMembers)))
 	mux.Handle("POST /api/projects/{projectID}/members", s.auth.Middleware(http.HandlerFunc(s.addProjectMember)))
@@ -79,18 +79,12 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PATCH /api/projects/{projectID}/perspectives/{perspectiveID}", s.auth.Middleware(http.HandlerFunc(s.patchPerspective)))
 	mux.Handle("POST /api/projects/{projectID}/tracks", s.auth.Middleware(http.HandlerFunc(s.createTrack)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.patchClips)))
-	// Bulk delete via DELETE with JSON body — replaces old POST /clips/delete workaround.
 	mux.Handle("DELETE /api/projects/{projectID}/clips", s.auth.Middleware(http.HandlerFunc(s.deleteClips)))
 	mux.Handle("PATCH /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.patchClip)))
-	mux.Handle("DELETE /api/projects/{projectID}/clips/{clipID}", s.auth.Middleware(http.HandlerFunc(s.deleteClip)))
-	// Combined state endpoint: replaces 4-5 sequential fetches (project + manifest +
-	// markers + regions + members) with a single round-trip.
 	mux.Handle("GET /api/projects/{projectID}/state", s.auth.Middleware(http.HandlerFunc(s.getProjectState)))
-	mux.Handle("GET /api/projects/{projectID}/markers", s.auth.Middleware(http.HandlerFunc(s.listMarkers)))
 	mux.Handle("POST /api/projects/{projectID}/markers", s.auth.Middleware(http.HandlerFunc(s.createMarker)))
 	mux.Handle("PATCH /api/projects/{projectID}/markers/{markerID}", s.auth.Middleware(http.HandlerFunc(s.patchMarker)))
 	mux.Handle("DELETE /api/projects/{projectID}/markers/{markerID}", s.auth.Middleware(http.HandlerFunc(s.deleteMarker)))
-	mux.Handle("GET /api/projects/{projectID}/regions", s.auth.Middleware(http.HandlerFunc(s.listRegions)))
 	mux.Handle("POST /api/projects/{projectID}/regions", s.auth.Middleware(http.HandlerFunc(s.createRegion)))
 	mux.Handle("PATCH /api/projects/{projectID}/regions/{regionID}", s.auth.Middleware(http.HandlerFunc(s.patchRegion)))
 	mux.Handle("DELETE /api/projects/{projectID}/regions/{regionID}", s.auth.Middleware(http.HandlerFunc(s.deleteRegion)))
@@ -224,27 +218,6 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"id": id, "name": req.Name, "description": req.Description, "ownerUsername": p.Username})
 }
 
-func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
-	projectID, ok := pathID(w, r, "projectID")
-	if !ok {
-		return
-	}
-	if !s.requireProjectMember(w, r, projectID) {
-		return
-	}
-	var id int64
-	var name, desc, owner string
-	if err := s.db.QueryRowContext(r.Context(), `SELECT id, name, description, owner_username FROM projects WHERE id=?`, projectID).Scan(&id, &name, &desc, &owner); err != nil {
-		writeError(w, 404, err)
-		return
-	}
-	project := map[string]any{"id": id, "name": name, "description": desc, "ownerUsername": owner}
-	project["perspectives"] = s.queryRows(r.Context(), `SELECT id, name, sort_order FROM perspectives WHERE project_id=? ORDER BY sort_order,id`, projectID)
-	project["tracks"] = s.queryRows(r.Context(), `SELECT id, perspective_id, kind, name, sort_order FROM tracks WHERE project_id=? ORDER BY sort_order,id`, projectID)
-	project["clips"] = s.queryRows(r.Context(), `SELECT id, perspective_id, track_id, source_asset_id, source_revision_id, COALESCE(hls_asset_id,0), media_kind, wallclock_start_ms, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0), stream_index, display_name, ingest_status FROM clips WHERE project_id=? ORDER BY wallclock_start_ms,id`, projectID)
-	writeJSON(w, 200, project)
-}
-
 func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -266,10 +239,6 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-// getProjectState combines what was previously 4-5 sequential client fetches
-// (GET /projects/:id, GET /playback-manifest, GET /markers, GET /regions, GET /members)
-// into a single response.  Author colors are always read live from users table —
-// no stale cached copies.
 func (s *Server) getProjectState(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
 	if !ok {
@@ -337,7 +306,6 @@ ORDER BY c.wallclock_start_ms, c.id`, projectID)
 		return
 	}
 
-	// Author color always comes from users table — no stale cached copy.
 	markers := s.queryRows(r.Context(), `
 SELECT m.id, m.marker_ts_ms, m.author_username, u.color AS authorColor,
        m.label, COALESCE(m.note,'') AS note, m.created_at, m.updated_at
@@ -685,13 +653,18 @@ func (s *Server) createSourceRevisionClips(ctx context.Context, projectID int64,
 		status := "PENDING"
 		streamID := fmt.Sprintf("stream-%d", req.StreamIndex)
 		var hlsDur, hlsFPSNum, hlsFPSDen int64
+		var hlsPlaylistPath string
 		err = tx.QueryRowContext(ctx, `
-SELECT id, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0)
+SELECT id, duration_ms, COALESCE(fps_num,0), COALESCE(fps_den,0), COALESCE(playlist_path,'')
 FROM hls_assets WHERE source_revision_id=? AND stream_id=? AND transcode_profile_version=?`,
-			revID, streamID, s.cfg.TranscodeProfile).Scan(&hlsID, &hlsDur, &hlsFPSNum, &hlsFPSDen)
+			revID, streamID, s.cfg.TranscodeProfile).Scan(&hlsID, &hlsDur, &hlsFPSNum, &hlsFPSDen, &hlsPlaylistPath)
 		if err == nil {
-			status = "SUCCESS"
-			durationMS, fpsNum, fpsDen = hlsDur, hlsFPSNum, hlsFPSDen
+			if s.hlsAssetIsReusable(ctx, hlsID.Int64, hlsPlaylistPath) {
+				status = "SUCCESS"
+				durationMS, fpsNum, fpsDen = hlsDur, hlsFPSNum, hlsFPSDen
+			} else {
+				hlsID = sql.NullInt64{}
+			}
 		} else if err == sql.ErrNoRows {
 			err = nil
 		} else {
@@ -1209,29 +1182,15 @@ func (s *Server) deleteClips(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"deletedClipIds": deleted, "missingClipIds": missing})
 }
 
-func (s *Server) deleteClip(w http.ResponseWriter, r *http.Request) {
-	projectID, ok := pathID(w, r, "projectID")
-	if !ok {
-		return
+func (s *Server) hlsAssetIsReusable(ctx context.Context, hlsID int64, playlistPath string) bool {
+	if playlistPath != hlsassets.PlaylistPath(hlsID) {
+		return false
 	}
-	clipID, ok := pathID(w, r, "clipID")
-	if !ok {
-		return
+	if _, err := s.hls.Stat(ctx, storage.ObjectRef{Adapter: s.cfg.HLSAdapter, Path: playlistPath}); err != nil {
+		slog.InfoContext(ctx, "ignoring HLS database row because playlist is missing from storage", "hls_asset_id", hlsID, "playlist_path", playlistPath, "err", err)
+		return false
 	}
-	if !s.requireProjectEditor(w, r, projectID) {
-		return
-	}
-	res, err := s.db.ExecContext(r.Context(), `DELETE FROM clips WHERE id=? AND project_id=?`, clipID, projectID)
-	if err != nil {
-		writeError(w, 500, err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		writeError(w, 404, errors.New("clip not found"))
-		return
-	}
-	s.broadcast(r, projectID, "clip.deleted", map[string]any{"clipId": clipID})
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	return true
 }
 
 func (s *Server) cachedHLSURL(ctx context.Context, ref storage.ObjectRef, ttl time.Duration) (string, error) {
@@ -1273,21 +1232,6 @@ func (s *Server) cachedHLSURL(ctx context.Context, ref storage.ObjectRef, ttl ti
 	s.urlCache.m[key] = signedURLCacheEntry{url: u, expiresAt: now.Add(exp)}
 	s.urlCache.mu.Unlock()
 	return u, nil
-}
-
-func (s *Server) listMarkers(w http.ResponseWriter, r *http.Request) {
-	projectID, ok := pathID(w, r, "projectID")
-	if !ok {
-		return
-	}
-	if !s.requireProjectMember(w, r, projectID) {
-		return
-	}
-	writeJSON(w, 200, s.queryRows(r.Context(), `
-SELECT m.id, m.marker_ts_ms, m.author_username, u.color AS authorColor,
-       m.label, COALESCE(m.note,'') AS note, m.created_at, m.updated_at
-FROM markers m JOIN users u ON u.username=m.author_username
-WHERE m.project_id=? ORDER BY m.marker_ts_ms`, projectID))
 }
 
 func (s *Server) createMarker(w http.ResponseWriter, r *http.Request) {
@@ -1375,21 +1319,6 @@ func (s *Server) deleteMarker(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broadcast(r, projectID, "marker.deleted", map[string]any{"id": markerID})
 	writeJSON(w, 200, map[string]bool{"ok": true})
-}
-
-func (s *Server) listRegions(w http.ResponseWriter, r *http.Request) {
-	projectID, ok := pathID(w, r, "projectID")
-	if !ok {
-		return
-	}
-	if !s.requireProjectMember(w, r, projectID) {
-		return
-	}
-	writeJSON(w, 200, s.queryRows(r.Context(), `
-SELECT r.id, r.region_start_ms, r.region_end_ms, r.author_username, u.color AS authorColor,
-       r.label, COALESCE(r.note,'') AS note, r.created_at, r.updated_at
-FROM regions r JOIN users u ON u.username=r.author_username
-WHERE r.project_id=? ORDER BY r.region_start_ms`, projectID))
 }
 
 func (s *Server) createRegion(w http.ResponseWriter, r *http.Request) {
@@ -1482,9 +1411,15 @@ func (s *Server) deleteRegion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-func (s *Server) exportCSV(w http.ResponseWriter, r *http.Request)      { s.withItems(w, r, "text/csv", "markers.csv", exp.WriteCSV) }
-func (s *Server) exportMarkdown(w http.ResponseWriter, r *http.Request) { s.withItems(w, r, "text/markdown", "markers.md", exp.WriteMarkdown) }
-func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request)     { s.withItems(w, r, "application/json", "markers.json", exp.WriteJSON) }
+func (s *Server) exportCSV(w http.ResponseWriter, r *http.Request) {
+	s.withItems(w, r, "text/csv", "markers.csv", exp.WriteCSV)
+}
+func (s *Server) exportMarkdown(w http.ResponseWriter, r *http.Request) {
+	s.withItems(w, r, "text/markdown", "markers.md", exp.WriteMarkdown)
+}
+func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request) {
+	s.withItems(w, r, "application/json", "markers.json", exp.WriteJSON)
+}
 
 func (s *Server) exportEDL(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := pathID(w, r, "projectID")
@@ -1556,10 +1491,10 @@ func (s *Server) localHLS(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case strings.HasSuffix(p, ".m3u8"):
-		w.Header().Set("content-type", "application/vnd.apple.mpegurl")
-		w.Header().Set("cache-control", "no-cache")
+		w.Header().Set("content-type", hlsassets.PlaylistContentType)
+		w.Header().Set("cache-control", "no-store")
 	case strings.HasSuffix(p, ".ts"):
-		w.Header().Set("content-type", "video/MP2T")
+		w.Header().Set("content-type", hlsassets.SegmentContentType)
 		w.Header().Set("cache-control", "public, max-age=31536000, immutable")
 	default:
 		w.Header().Set("cache-control", "private, max-age=300")

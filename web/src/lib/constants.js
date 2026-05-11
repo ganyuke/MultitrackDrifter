@@ -11,7 +11,7 @@ export const GRID_PRESET_CELLS = {
 export const DEFAULT_MEMBER_ROLE = 'editor';
 
 // Must match internal/auth.Palette; the backend rejects colors outside the accessible palette.
-export const ACCENT_COLORS = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#F0E442', '#56B4E9', '#E69F00', '#8F00FF'];
+export const ACCENT_COLORS = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#8F00FF'];
 
 export const MS_PER_SECOND = 1000;
 export const SECONDS_PER_MINUTE = 60;
@@ -19,7 +19,6 @@ export const PERCENT_SCALE = 100;
 
 export const TIMING = {
   playbackSyncIntervalMs: 250,
-  ingestRefreshIntervalMs: 5000,
   defaultErrorTimeoutMs: 5000,
   colorErrorTimeoutMs: 4000,
   ingestRefreshDelayMs: 1200,
@@ -77,10 +76,6 @@ export const PRESENCE = {
 
 export const HISTORY = {
   maxUndoEntries: 50
-};
-
-export const HTTP_STATUS = {
-  notFound: 404
 };
 
 export const TIME_FORMAT = {

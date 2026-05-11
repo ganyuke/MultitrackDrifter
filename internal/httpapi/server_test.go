@@ -13,9 +13,11 @@ import (
 	"github.com/example/multitrack-drifter/internal/auth"
 	"github.com/example/multitrack-drifter/internal/config"
 	dbpkg "github.com/example/multitrack-drifter/internal/db"
+	"github.com/example/multitrack-drifter/internal/hlsassets"
 	"github.com/example/multitrack-drifter/internal/ingest"
 	"github.com/example/multitrack-drifter/internal/realtime"
 	"github.com/example/multitrack-drifter/internal/storage"
+	"github.com/example/multitrack-drifter/internal/storage/localstore"
 )
 
 func TestCreateSourceRevisionClipsCreatesFreshClipWhenHLSExists(t *testing.T) {
@@ -33,9 +35,10 @@ func TestCreateSourceRevisionClipsCreatesFreshClipWhenHLSExists(t *testing.T) {
 		},
 	}
 	assetID, revID := insertTestSourceRevision(t, ctx, db, info, "Camera A")
-	hlsID := insertTestHLSAsset(t, ctx, db, revID, "stream-0", "test-profile")
+	hlsStore := newTestHLSStore(t)
+	hlsID := insertTestHLSAsset(t, ctx, db, hlsStore, revID, "stream-0", "test-profile")
 
-	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile"}}
+	s := &Server{db: db, cfg: config.Config{TranscodeProfile: "test-profile", HLSAdapter: "local"}, hls: hlsStore}
 	req := createClipReq{
 		Perspective:      "Main",
 		Track:            "Video 0",
@@ -328,7 +331,7 @@ func TestDeleteClipsBatchReturnsMissingIDsAsAlreadyGone(t *testing.T) {
 	}
 	missingID := int64(999998)
 	body := strings.NewReader(`{"clipIds":[` + itoa(clipIDs[0]) + `,` + itoa(missingID) + `]}`)
-	req := httptest.NewRequest("POST", "/api/projects/1/clips/delete", body)
+	req := httptest.NewRequest("DELETE", "/api/projects/1/clips", body)
 	req.SetPathValue("projectID", itoa(projectID))
 	req = req.WithContext(context.WithValue(req.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#abcdef"}))
 	rr := httptest.NewRecorder()
@@ -356,51 +359,41 @@ func TestDeleteClipsBatchReturnsMissingIDsAsAlreadyGone(t *testing.T) {
 	}
 }
 
-func TestListAnnotationsUsesCurrentUserColor(t *testing.T) {
+func TestProjectStateUsesCurrentUserColorForAnnotations(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t, ctx)
 	projectID := insertTestProject(t, ctx, db)
 	if _, err := db.ExecContext(ctx, `UPDATE users SET color='#0072B2' WHERE username='owner'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO markers(project_id, marker_ts_ms, author_username, author_color, label) VALUES (?, 1000, 'owner', '#D55E00', 'Old marker color')`, projectID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO markers(project_id, marker_ts_ms, author_username, label) VALUES (?, 1000, 'owner', 'Marker')`, projectID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO regions(project_id, region_start_ms, region_end_ms, author_username, author_color, label) VALUES (?, 1000, 2000, 'owner', '#D55E00', 'Old region color')`, projectID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO regions(project_id, region_start_ms, region_end_ms, author_username, label) VALUES (?, 1000, 2000, 'owner', 'Region')`, projectID); err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{db: db, hub: realtime.NewHub()}
 
-	markerReq := httptest.NewRequest("GET", "/api/projects/1/markers", nil)
-	markerReq.SetPathValue("projectID", itoa(projectID))
-	markerReq = markerReq.WithContext(context.WithValue(markerReq.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#0072B2"}))
-	markerRR := httptest.NewRecorder()
-	s.listMarkers(markerRR, markerReq)
-	if markerRR.Code != 200 {
-		t.Fatalf("listMarkers status = %d body=%s", markerRR.Code, markerRR.Body.String())
+	req := httptest.NewRequest("GET", "/api/projects/1/state", nil)
+	req.SetPathValue("projectID", itoa(projectID))
+	req = req.WithContext(context.WithValue(req.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#0072B2"}))
+	rr := httptest.NewRecorder()
+	s.getProjectState(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("getProjectState status = %d body=%s", rr.Code, rr.Body.String())
 	}
-	var markers []map[string]any
-	if err := json.NewDecoder(markerRR.Body).Decode(&markers); err != nil {
+	var state struct {
+		Markers []map[string]any `json:"markers"`
+		Regions []map[string]any `json:"regions"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&state); err != nil {
 		t.Fatal(err)
 	}
-	if len(markers) != 1 || markers[0]["author_color"] != "#0072B2" || markers[0]["color"] != "#0072B2" {
-		t.Fatalf("marker did not use current user color: %#v", markers)
+	if len(state.Markers) != 1 || state.Markers[0]["authorColor"] != "#0072B2" {
+		t.Fatalf("marker did not use current user color: %#v", state.Markers)
 	}
-
-	regionReq := httptest.NewRequest("GET", "/api/projects/1/regions", nil)
-	regionReq.SetPathValue("projectID", itoa(projectID))
-	regionReq = regionReq.WithContext(context.WithValue(regionReq.Context(), auth.PrincipalKey, auth.Principal{Username: "owner", Color: "#0072B2"}))
-	regionRR := httptest.NewRecorder()
-	s.listRegions(regionRR, regionReq)
-	if regionRR.Code != 200 {
-		t.Fatalf("listRegions status = %d body=%s", regionRR.Code, regionRR.Body.String())
-	}
-	var regions []map[string]any
-	if err := json.NewDecoder(regionRR.Body).Decode(&regions); err != nil {
-		t.Fatal(err)
-	}
-	if len(regions) != 1 || regions[0]["author_color"] != "#0072B2" || regions[0]["color"] != "#0072B2" {
-		t.Fatalf("region did not use current user color: %#v", regions)
+	if len(state.Regions) != 1 || state.Regions[0]["authorColor"] != "#0072B2" {
+		t.Fatalf("region did not use current user color: %#v", state.Regions)
 	}
 }
 
@@ -427,9 +420,6 @@ func insertTestProject(t *testing.T, ctx context.Context, db *sql.DB) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO project_memberships(project_id, username, role) VALUES (?, 'owner', 'owner')`, projectID); err != nil {
-		t.Fatal(err)
-	}
 	return projectID
 }
 
@@ -454,14 +444,30 @@ func insertTestSourceRevision(t *testing.T, ctx context.Context, db *sql.DB, inf
 	return assetID, revID
 }
 
-func insertTestHLSAsset(t *testing.T, ctx context.Context, db *sql.DB, revID int64, streamID, profile string) int64 {
+func newTestHLSStore(t *testing.T) storage.HLSStore {
 	t.Helper()
-	res, err := db.ExecContext(ctx, `INSERT INTO hls_assets(source_revision_id, adapter, playlist_path, stream_id, media_kind, transcode_profile_version, duration_ms, fps_num, fps_den) VALUES (?, 'local', 'rev/index.m3u8', ?, 'video', ?, 4321, 30, 1)`, revID, streamID, profile)
+	hls, err := localstore.NewHLS(t.TempDir(), "/media/hls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hls
+}
+
+func insertTestHLSAsset(t *testing.T, ctx context.Context, db *sql.DB, hls storage.HLSStore, revID int64, streamID, profile string) int64 {
+	t.Helper()
+	res, err := db.ExecContext(ctx, `INSERT INTO hls_assets(source_revision_id, playlist_path, stream_id, media_kind, transcode_profile_version, duration_ms, fps_num, fps_den) VALUES (?, '', ?, 'video', ?, 4321, 30, 1)`, revID, streamID, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hlsID, err := res.LastInsertId()
 	if err != nil {
+		t.Fatal(err)
+	}
+	playlistPath := hlsassets.PlaylistPath(hlsID)
+	if _, err := db.ExecContext(ctx, `UPDATE hls_assets SET playlist_path=? WHERE id=?`, playlistPath, hlsID); err != nil {
+		t.Fatal(err)
+	}
+	if err := hls.Put(ctx, storage.ObjectRef{Adapter: "local", Path: playlistPath}, strings.NewReader("#EXTM3U\n#EXT-X-ENDLIST\n"), hlsassets.PlaylistContentType); err != nil {
 		t.Fatal(err)
 	}
 	return hlsID

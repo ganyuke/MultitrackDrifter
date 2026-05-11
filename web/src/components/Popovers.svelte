@@ -114,13 +114,13 @@
               <span class="member-user muted">{member.username}</span>
             </div>
             {#if app.isProjectOwner && member.role !== 'owner'}
-              <select class="member-role-select" value={member.role === 'member' ? 'editor' : member.role} onchange={(event) => app.updateProjectMemberRole?.(member, event.currentTarget.value)}>
+              <select class="member-role-select" value={member.role} onchange={(event) => app.updateProjectMemberRole?.(member, event.currentTarget.value)}>
                 <option value="editor">Editor</option>
                 <option value="viewer">Viewer</option>
               </select>
               <button class="topbar-icon-btn" title="Remove" onclick={() => app.removeProjectMember?.(member)}>×</button>
             {:else}
-              <span class="role-pill {member.role}">{member.role === 'member' ? 'editor' : member.role}</span>
+              <span class="role-pill {member.role}">{member.role}</span>
             {/if}
           </div>
         {:else}

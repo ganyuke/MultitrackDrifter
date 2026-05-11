@@ -90,8 +90,8 @@ Open `http://127.0.0.1:8080`, log in, create a project, and add source files as 
 Click **Trigger ingest**. The worker runs FFprobe/FFmpeg and writes immutable HLS assets to the HLS root, for example:
 
 ```text
-/mnt/drifter-hls/rev-1/stream-0/poc-480p-v1/<fingerprint>/index.m3u8
-/mnt/drifter-hls/rev-1/stream-0/poc-480p-v1/<fingerprint>/seg_000.ts
+/mnt/drifter-hls/previews/playlists/<hls_asset_id>.m3u8
+/mnt/drifter-hls/previews/hls/<sha[0:2]>/<sha[2:4]>/<sha>.ts
 ```
 
 The playback manifest returns `/media/hls/...` URLs only. Original source paths are never sent as playback URLs.
