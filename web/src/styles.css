@@ -127,6 +127,11 @@ input[type=checkbox] { width:12px; height:12px; margin:0; cursor:pointer; }
 .float-footer input { flex:1; }
 .float-panel > label { padding:5px 8px 0; font-size:10px; color:var(--muted); display:grid; gap:3px; }
 .float-panel > label input, .float-panel > label textarea { font-size:11px; }
+.float-title {
+	overflow: clip;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
 
 .color-float { top:calc(var(--topbar-h) + 4px); right:36px; width:160px; padding-bottom:8px; }
 .color-swatches { display:grid; grid-template-columns:repeat(4,1fr); gap:5px; padding:8px; }
@@ -194,7 +199,7 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .panel-head { height:28px; display:flex; align-items:center; justify-content:space-between; padding:0 8px; border-bottom:1px solid var(--line); background:var(--raised); flex-shrink:0; }
 .panel-label { font-size:9px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--muted2); }
 .breadcrumb { display:flex; align-items:center; flex-wrap:nowrap; overflow:hidden; height:22px; padding:0 5px; border-bottom:1px solid var(--line); gap:1px; flex-shrink:0; }
-.crumb { height:18px; border:none; background:transparent; color:var(--blue); cursor:pointer; padding:0 3px; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80px; }
+.crumb { height:18px; border:none; background:transparent; color:var(--yellow); cursor:pointer; padding:0 3px; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80px; }
 .crumb:hover { text-decoration:underline; }
 .crumb-sep { color:var(--muted2); font-size:10px; }
 .source-file-list { min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:1px; padding:3px; }
@@ -267,7 +272,7 @@ kbd { display:inline-block; padding:1px 5px; border:1px solid var(--line2); back
 .timeline-body { min-height:0; display:grid; grid-template-columns:var(--track-lbl) minmax(0,1fr); overflow-y:auto; overflow-x:auto; }
 .label-rail { border-right:1px solid var(--line); background:#0e1320; align-self:start; min-width:0; }
 .label-corner { height:26px; background:#0c1018; border-bottom:1px solid var(--line); }
-.lane-scroll { min-width:0; overflow-x:auto; overflow-y:hidden; align-self:start; position:relative; }
+.lane-scroll { min-width:0; overflow-x:auto; overflow-y:hidden; align-self:start; position:relative; height: 100% }
 .lane-canvas { min-width:100%; width:max-content; position:relative; padding-top:26px; }
 .marquee-box { position:absolute; border:1px solid var(--blue); background:rgba(74,144,226,.14); pointer-events:none; z-index:20; box-shadow:0 0 0 1px rgba(0,0,0,.35) inset; }
 
@@ -417,7 +422,8 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .member-hint strong { color:var(--text); font-weight:700; }
 .member-message { font-size:10px; color:var(--yellow); overflow-wrap:anywhere; }
 .member-list { display:grid; }
-.member-row { display:flex; align-items:center; gap:6px; min-height:34px; padding:5px 6px; border-bottom:1px solid var(--line); overflow:hidden; }
+.member-row { display:flex; align-items:center; gap:6px; min-height:34px; padding:5px 6px; overflow:hidden; }
+.member-row + .member-row { border-top:1px solid var(--line); }
 .member-avatar { width:18px; height:18px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; color:#fff; font-size:10px; font-weight:800; }
 .member-main { flex:1; min-width:0; display:grid; gap:1px; }
 .member-name { font-size:11px; font-weight:700; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
@@ -473,9 +479,11 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .ribbon-chevron { opacity:.5; margin-left:1px; }
 
 .ribbon-settings-btn {
-  display:flex; align-items:center; padding:0 4px; height:20px;
+  padding:0 4px; height:20px;
   background:none; border:none; color:var(--muted); cursor:pointer;
-  border-radius:3px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
 }
 .ribbon-settings-btn:hover { color:var(--fg); background:var(--hover-bg); }
 
@@ -507,7 +515,7 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 
 /* ── Themed action button ──────────────────────────────────────────── */
 .btn-theme {
-  padding:4px 12px; border-radius:4px; border:none; cursor:pointer;
+  border-radius:4px; border:none; cursor:pointer;
   background:#2a4a8a; color:#e8f0ff; font-family:inherit; font-size:11px;
   font-weight:500;
 }
@@ -526,18 +534,6 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .ann-footer { flex-direction:column; align-items:stretch; gap:6px; }
 .ann-footer-actions { display:flex; gap:6px; justify-content:flex-end; }
 
-/* ── Project title display (larger, more breathing room) ───────────── */
-.project-title-display {
-  font-size:14px; font-weight:600; color:var(--fg);
-  padding:0 10px; letter-spacing:.01em;
-  display:flex; align-items:center; gap:8px;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  max-width:320px;
-}
-
-/* ── Grid icon button (restore original look) ──────────────────────── */
-.topbar-grid-btn { padding:0 8px; }
-
 /* ── Cog menu wrapper + dropdown ───────────────────────────────────── */
 .proj-menu-wrap { position:relative; display:flex; align-items:center; }
 .proj-menu-dropdown {
@@ -546,19 +542,6 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   border-radius:5px; box-shadow:0 4px 16px rgba(0,0,0,.4);
   min-width:160px; padding:4px 0; display:flex; flex-direction:column;
 }
-.proj-menu-item {
-  display:flex; align-items:center; gap:8px;
-  padding:7px 12px; background:none; border:none;
-  color:var(--fg); cursor:pointer; font-family:inherit; font-size:12px;
-  text-align:left; white-space:nowrap;
-}
-.proj-menu-item:hover { background:var(--hover-bg); }
-.proj-menu-item svg { flex-shrink:0; opacity:.7; }
-
-/* ── Members + Maintenance float panels ────────────────────────────── */
-.members-float { left:180px; width:320px; }
-.members-float-body { padding:8px 0; }
-.maintenance-float { left:180px; width:240px; }
 
 /* ── Project menu / members / maintenance float panels ─────────────────
    All spawn at the same anchor: just below the topbar, left-aligned
@@ -566,7 +549,7 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .proj-menu-float  { top:calc(var(--topbar-h) + 4px); left:160px; width:200px; padding-bottom:4px; }
 .members-float    { top:calc(var(--topbar-h) + 4px); left:160px; width:320px; padding-bottom:8px; }
 .maintenance-float{ top:calc(var(--topbar-h) + 4px); left:160px; width:240px; padding-bottom:8px; }
-.members-float-body { padding:4px 0; }
+.members-float-body { padding:5px 8px; }
 
 /* proj-menu items inside the float panel */
 .proj-menu-item {
@@ -580,8 +563,8 @@ dd { margin:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 /* ── Project title display ─────────────────────────────────────────── */
 .project-title-display {
   font-size:14px; font-weight:600; color:var(--text);
-  padding:0 10px; letter-spacing:.01em;
-  display:flex; align-items:center; gap:8px;
+  letter-spacing:.01em;
+  gap:8px;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   max-width:320px;
 }

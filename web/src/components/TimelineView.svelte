@@ -67,10 +67,10 @@
     <div class="tbar-l">
       <button class="tbar-play-btn {playing ? 'tbar-pause' : 'tbar-play'}" onclick={ontoggleplay}>{playing ? 'Pause' : 'Play'}</button>
       <button class="tbar-tool-btn" onclick={onaddmarker} title="Marker (M)">
-        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M5 1L6.5 4h3l-2.5 2 1 3L5 7l-3 3 1-3L.5 4h3z" fill="#f6c85f"/></svg>Marker
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" style="color: rgb(228, 171, 0);" width="10" height="10" viewBox="0 0 24 24"><path fill="currentColor" d="M22 10.1c.1-.5-.3-1.1-.8-1.1l-5.7-.8L12.9 3c-.1-.2-.2-.3-.4-.4c-.5-.3-1.1-.1-1.4.4L8.6 8.2L2.9 9q-.45 0-.6.3c-.4.4-.4 1 0 1.4l4.1 4l-1 5.7c0 .2 0 .4.1.6c.3.5.9.7 1.4.4l5.1-2.7l5.1 2.7c.1.1.3.1.5.1h.2c.5-.1.9-.6.8-1.2l-1-5.7l4.1-4c.2-.1.3-.3.3-.5"></path></svg>Marker
       </button>
       <button class="tbar-tool-btn" onclick={onaddregion} title="Region (R)">
-        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="3" width="9" height="4" rx="1" stroke="#8f70ff" stroke-width="1.2" fill="rgba(143,112,255,.2)"/></svg>Region
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" style="color: rgb(128, 82, 246);" width="10" height="10" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M3 6a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h18a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3zm6 2H7v5a1 1 0 1 1-2 0V8H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h18a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1h-2v3a1 1 0 1 1-2 0V8h-2v5a1 1 0 1 1-2 0V8h-2v3a1 1 0 1 1-2 0z" clip-rule="evenodd"></path></svg>Region
       </button>
       <button class="tbar-tool-btn {snapEnabled ? 'tbar-active' : ''}" onclick={ontogglesnap} title="Snap clip edges to playhead, markers, regions, and other clip edges">Snap</button>
       <button class="tbar-tool-btn {linkedMoveEnabled ? 'tbar-active' : ''}" onclick={ontogglelink} title="Move linked video/audio clips together">Link</button>

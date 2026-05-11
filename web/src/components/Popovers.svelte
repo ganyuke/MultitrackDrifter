@@ -74,15 +74,15 @@
 {#if showProjectMenu && current}
   <FloatPanel title={current.name} klass="proj-menu-float" onclose={app.closeProjectMenu}>
     <button class="proj-menu-item" onclick={app.openProjectEditFromMenu}>
-      <svg width="11" height="11" viewBox="0 0 12 12"><path d="M8.5 1.5l2 2L3 11H1v-2L8.5 1.5z" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="16" height="16" viewBox="0 0 24 24"><g fill="currentColor"><path fill-rule="evenodd" d="M10 4H8v2H5a3 3 0 0 0-3 3v6a3 3 0 0 0 3 3h3v2h2zM8 8v8H5a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z" clip-rule="evenodd"></path><path d="M19 16h-7v2h7a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3h-7v2h7a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1"></path></g></svg>
       Rename / Edit
     </button>
     <button class="proj-menu-item" onclick={app.openMembersPanelFromMenu}>
-      <svg width="11" height="11" viewBox="0 0 12 12"><circle cx="4.5" cy="3.5" r="2" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M1 10c0-2 1.6-3 3.5-3s3.5 1 3.5 3" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/><path d="M8 5.5c1.1.3 2 1.2 2 2.5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/><circle cx="9" cy="3" r="1.2" stroke="currentColor" stroke-width="1.1" fill="none"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="16" height="16" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="square" stroke-width="2" d="M16 20v-1a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v1M12.5 7a4 4 0 1 1-8 0a4 4 0 0 1 8 0Zm3 4a4 4 0 0 0 0-8M23 20v-1a4 4 0 0 0-4-4"></path></svg>
       Members
     </button>
     <button class="proj-menu-item" onclick={app.openMaintenancePanelFromMenu}>
-      <svg width="11" height="11" viewBox="0 0 12 12"><path d="M9.5 2.5l-1 1-2-2 1-1a2 2 0 012.5 0l-.5.5v1.5zM2 10l5-5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/><circle cx="2.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="16" height="16" viewBox="0 0 24 24"><path fill="currentColor" d="M6.12 20.75c-.76 0-1.48-.3-2.03-.84a2.86 2.86 0 0 1 0-4.05l5.51-5.51c-.5-1.94.04-4.03 1.46-5.45a5.67 5.67 0 0 1 5.48-1.46c.26.07.46.27.53.53s0 .53-.19.72l-2.45 2.45l.52 1.91l1.91.52l2.45-2.45c.19-.19.47-.26.72-.19c.26.07.46.27.53.53c.53 1.95-.02 4.05-1.46 5.48c-1.42 1.42-3.51 1.96-5.45 1.46l-5.51 5.51c-.54.54-1.26.84-2.02.84m8.56-15.98c-.96.08-1.87.5-2.57 1.2c-1.14 1.14-1.51 2.81-.96 4.35c.1.27.03.58-.18.78l-5.83 5.83c-.53.53-.53 1.4 0 1.93c.26.26.6.4.97.4c.36 0 .71-.14.96-.4l5.83-5.83c.21-.21.51-.27.78-.18c1.54.54 3.21.18 4.35-.96c.7-.7 1.11-1.61 1.2-2.57l-1.63 1.63c-.19.19-.47.26-.73.19l-2.74-.75a.75.75 0 0 1-.53-.53l-.75-2.74c-.07-.26 0-.54.19-.73l1.63-1.63Z"></path></svg>
       Maintenance
     </button>
   </FloatPanel>

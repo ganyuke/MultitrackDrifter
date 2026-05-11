@@ -5,7 +5,9 @@
 <div class="float-panel {klass}">
   {#if title || actions || onclose}
     <div class="float-head">
-      <span>{title}</span>
+      <div class="float-title">
+        <span>{title}</span>
+      </div>
       {#if actions}
         <div class="float-head-actions">{@render actions()}</div>
       {:else if onclose}
